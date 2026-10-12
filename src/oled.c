@@ -447,3 +447,41 @@ void 显示_画中文(uint8_t 列, uint8_t 行, const char *串)
         串 += 步进;
     }
 }
+
+/* ============================== 空心框 ===================================== */
+
+/**
+  * @brief  在帧缓冲中画一个 1 像素宽的空心矩形框
+  * @note   直接操作帧缓冲像素，框线为 1 像素宽；
+  *         坐标超出屏幕范围的部分被自动裁剪。
+  */
+void 显示_画空心框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
+{
+    uint8_t x, y;
+
+    if (x0 > 127U) x0 = 127U;
+    if (x1 > 127U) x1 = 127U;
+    if (y0 > 63U)  y0 = 63U;
+    if (y1 > 63U)  y1 = 63U;
+
+    if (x0 > x1 || y0 > y1) return;
+
+    for (x = x0; x <= x1; x++)
+    {
+        uint8_t page_t = y0 >> 3;
+        uint8_t bit_t  = y0 & 0x07U;
+        显示_帧缓冲[(uint16_t)page_t * 显示_宽度 + x] |= (uint8_t)(1U << bit_t);
+
+        uint8_t page_b = y1 >> 3;
+        uint8_t bit_b  = y1 & 0x07U;
+        显示_帧缓冲[(uint16_t)page_b * 显示_宽度 + x] |= (uint8_t)(1U << bit_b);
+    }
+
+    for (y = y0; y <= y1; y++)
+    {
+        uint8_t page = y >> 3;
+        uint8_t bit  = y & 0x07U;
+        显示_帧缓冲[(uint16_t)page * 显示_宽度 + x0] |= (uint8_t)(1U << bit);
+        显示_帧缓冲[(uint16_t)page * 显示_宽度 + x1] |= (uint8_t)(1U << bit);
+    }
+}

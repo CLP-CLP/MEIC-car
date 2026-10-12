@@ -35,7 +35,7 @@ except ImportError:
 
 SRC_DIRS = ["src", "include"]       # 扫描哪些目录
 OUTPUT_FILE = "src/cn_font_data.h"  # 输出头文件
-FONT_SIZE = 16                      # 字号（点数）
+FONT_SIZE = 12                      # 字号（点数，12pt 更紧凑，Marlin 风格）
 FONT_PATH = None                    # None = 自动查找系统字体
 
 # 备选字体列表（Windows 按优先级排列）

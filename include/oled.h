@@ -70,6 +70,15 @@ void 显示_画字符串(uint8_t 列, uint8_t 行, const char *串);
   */
 void 显示_画中文(uint8_t 列, uint8_t 行, const char *中英文字符串);
 
+/**
+  * @brief  在帧缓冲中画一个 1 像素宽的空心矩形框（Marlin 风格选中标记）
+  * @param  x0  左边界（像素坐标，0~127）
+  * @param  y0  上边界（像素坐标，0~63）
+  * @param  x1  右边界（像素坐标，0~127）
+  * @param  y1  下边界（像素坐标，0~63）
+  */
+void 显示_画空心框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
+
 #ifdef __cplusplus
 }
 #endif
