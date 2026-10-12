@@ -88,6 +88,14 @@ void 显示_画空心框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
 /** 反白一小块矩形区域（用于“反白选中”风格，可选） */
 void 显示_反白框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1);
 
+/**
+  * @brief  量一段文字的真实墨水宽度（不是按格子数拍脑袋）
+  * @param  串  待测的 UTF-8 串
+  * @retval 墨水占用的像素宽度（0 = 空串或没有可用字模）
+  * @note   画选中框时用它来定右边界，保证边框线不会切到汉字的笔画。
+  */
+uint8_t 显示_文字像素宽(const char *串);
+
 #ifdef __cplusplus
 }
 #endif

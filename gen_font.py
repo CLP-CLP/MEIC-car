@@ -50,7 +50,7 @@ OUTPUT_FILE = "src/cn_font_data.h"   # 输出
 FONT_PATH = None                     # None = 自动查找；也可写死一个 .ttf/.ttc
 
 CELL = 16                            # 单字格子尺寸（像素）
-INK_MAX = 15                         # 墨迹最大尺寸：留 1 像素余量，绝不越界
+INK_MAX = 13                         # 墨迹最大尺寸：上下左右各留 1.5 像素余量
 
 # 自动挑选字号时的候选（从大到小）
 FONT_SIZE_CANDIDATES = [16, 15, 14, 13, 12]
@@ -71,14 +71,12 @@ _LINUX_FONTS = [
 ]
 
 
-def find_chinese_font():
-    """自动查找系统中文字体"""
+def find_chinese_fonts():
+    """返回所有可用的候选中文字体（按优先级），供 choose_font 逐个试"""
     import platform
 
-    for f in (_WIN_FONTS if platform.system() == "Windows" else _LINUX_FONTS):
-        if os.path.exists(f):
-            return f
-    return None
+    cands = _WIN_FONTS if platform.system() == "Windows" else _LINUX_FONTS
+    return [f for f in cands if os.path.exists(f)]
 
 
 # ============================ 字符扫描 =======================================
@@ -131,27 +129,30 @@ def render_ink(ch, font):
     return canvas.crop(bbox), bbox
 
 
-def glyph_from_ink(ink):
+def glyph_from_ink(ink, allow_scale=False):
     """
-    把墨迹图**按比例压进 INK_MAX x INK_MAX 以内并居中**，再转成 32 字节列序点阵。
+    把墨迹放进 INK_MAX x INK_MAX 的“安全盒”，再居中放进 16x16，转成 32 字节列序点阵。
 
-    返回 (bytes32, (w, h))；如果墨迹为空返回 (None, None)。
+    allow_scale=False（默认）时**不做任何缩放**：装不下就直接报“装不下”，
+    交给 choose_font() 去换更小的字号。缩放会把笔画糊在一起（比如 13px 的
+    “菜单”两个字会被缩成一团），所以宁可换字号也不缩。
+
+    返回 (bytes32, (w, h))；墨迹为空返回 (None, None)。
     """
     iw, ih = ink.size
     if iw <= 0 or ih <= 0:
         return None, None
 
-    # 等比缩放到不超过 INK_MAX（只缩不放，保持笔画锐利）
-    scale = min(1.0, INK_MAX / iw, INK_MAX / ih)
-    if scale < 1.0:
+    if iw > INK_MAX or ih > INK_MAX:
+        if not allow_scale:
+            return None, (iw, ih)
+        scale = min(INK_MAX / iw, INK_MAX / ih)
         nw = max(1, int(round(iw * scale)))
         nh = max(1, int(round(ih * scale)))
         ink = ink.resize((nw, nh), Image.LANCZOS)
         iw, ih = nw, nh
 
-    # 先居中放进 INK_MAX x INK_MAX 的“安全盒”，再把安全盒居中放进 16x16 格子。
-    # 这样上下左右都至少留出 (CELL-INK_MAX)/2 的余量，笔画不会贴边、
-    # 也不会有一行字紧贴着下一行字。
+    # 先居中放进安全盒，再把安全盒居中放进格子 —— 上下左右余量对称
     box = Image.new("L", (INK_MAX, INK_MAX), 0)
     box.paste(ink, ((INK_MAX - iw) // 2, (INK_MAX - ih) // 2))
 
@@ -194,46 +195,86 @@ def ink_extent(data):
     return min(xs), max(xs), min(ys), max(ys)
 
 
-def choose_font(font_path, chars):
+def choose_font(font_paths, chars):
     """
-    从大到小挑字号：要求**所有**字的墨迹压进格子后都在 15x15 以内。
-    返回 (font, size, glyphs_dict, stats)。
+    挑选 (字体, 字号)：优先“**不需要缩放**就能装进 INK_MAX 格子”的组合，
+    并且在这种组合里挑墨迹最大的（字最大最饱满）。
+
+    缩放会糊笔画，所以只有实在找不到不缩放的组合时才退而求其次。
+
+    返回 (font, size, font_path, glyphs_dict, need_scale)
     """
-    best = None
-    for size in FONT_SIZE_CANDIDATES:
-        font = ImageFont.truetype(font_path, size)
-        glyphs = {}
-        ok = True
-        worst = 0
-        for ch in chars:
-            ink, _ = render_ink(ch, font)
-            data, (w, h) = glyph_from_ink(ink) if ink is not None else (None, None)
-            if data is None:
-                data = bytes(32)
-                w = h = 0
-            glyphs[ch] = data
-            worst = max(worst, w, h)
-            if w > INK_MAX or h > INK_MAX:
-                ok = False
-                break
-        if ok:
-            best = (font, size, glyphs, worst)
-            break
-        print(f"  字号 {size}: 有字模超过 {INK_MAX}x{INK_MAX}（最大 {worst}），试更小的字号")
+    best_no_scale = None      # (最大墨迹, font, size, path, glyphs)
+    best_scaled = None
 
-    if best is None:
-        raise RuntimeError("没有任何候选字号能让所有字模装进格子")
+    for path in font_paths:
+        if not os.path.exists(path):
+            continue
+        for size in FONT_SIZE_CANDIDATES:
+            font = ImageFont.truetype(path, size)
+            glyphs = {}
+            worst = 0
+            overflow = False
 
-    return best
+            for ch in chars:
+                ink, _ = render_ink(ch, font)
+                if ink is None:
+                    glyphs[ch] = bytes(32)
+                    continue
+                data, (w, h) = glyph_from_ink(ink, allow_scale=False)
+                worst = max(worst, w, h)
+                if data is None:
+                    overflow = True
+                    break
+                glyphs[ch] = data
+
+            if not overflow:
+                if best_no_scale is None or worst > best_no_scale[0]:
+                    best_no_scale = (worst, font, size, path, glyphs)
+
+    if best_no_scale is not None:
+        worst, font, size, path, glyphs = best_no_scale
+        return font, size, path, glyphs, False
+
+    # 退路：允许缩放
+    print(f"  !! 没有“不缩放就装得下”的字体/字号，改用缩放方案")
+    for path in font_paths:
+        if not os.path.exists(path):
+            continue
+        for size in FONT_SIZE_CANDIDATES:
+            font = ImageFont.truetype(path, size)
+            glyphs = {}
+            worst = 0
+            ok = True
+            for ch in chars:
+                ink, _ = render_ink(ch, font)
+                if ink is None:
+                    glyphs[ch] = bytes(32)
+                    continue
+                data, (w, h) = glyph_from_ink(ink, allow_scale=True)
+                if data is None:
+                    ok = False
+                    break
+                worst = max(worst, w, h)
+                glyphs[ch] = data
+            if ok:
+                if best_scaled is None or worst > best_scaled[0]:
+                    best_scaled = (worst, font, size, path, glyphs)
+
+    if best_scaled is None:
+        raise RuntimeError("没有任何字体/字号能生成字模")
+
+    worst, font, size, path, glyphs = best_scaled
+    return font, size, path, glyphs, True
 
 
-# ============================ 生成与自检 =====================================
-
-def build_glyph_table(font_path, chars, verbose=True):
+def build_glyph_table(font_paths, chars, verbose=True):
     """生成 {字符: 32 字节} 表，并做越界自检。"""
-    font, size, glyphs, worst = choose_font(font_path, chars)
+    font, size, path, glyphs, scaled = choose_font(font_paths, chars)
+
     if verbose:
-        print(f"  采用字号: {size}（最大墨迹 {worst}x{worst}，上限 {INK_MAX}）")
+        mode = "缩放" if scaled else "不缩放（笔画最锐利）"
+        print(f"  采用: {os.path.basename(path)}  字号 {size}  [{mode}]")
 
     problems = []
     for ch in chars:
@@ -254,7 +295,7 @@ def build_glyph_table(font_path, chars, verbose=True):
 
     if verbose:
         print(f"  自检通过: {len(chars)} 个字符全部在 {INK_MAX}x{INK_MAX} 以内")
-    return glyphs, size
+    return glyphs, size, path
 
 
 def write_header(chars, glyphs, size, font_path, output_path):
@@ -308,11 +349,12 @@ def main():
     root = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(root, OUTPUT_FILE)
 
-    font_path = FONT_PATH or find_chinese_font()
-    if not font_path:
+    fonts = [FONT_PATH] if FONT_PATH else find_chinese_fonts()
+    fonts = [f for f in fonts if f and os.path.exists(f)]
+    if not fonts:
         print("错误: 找不到中文字体，请在 gen_font.py 顶部写死 FONT_PATH")
         sys.exit(1)
-    print(f"字体: {font_path}")
+    print("候选字体: " + ", ".join(os.path.basename(f) for f in fonts))
 
     print("\n[1/3] 扫描源码字符串里的中文 ...")
     chars = find_chinese_chars(root, SRC_DIRS)
@@ -322,7 +364,7 @@ def main():
     print(f"  共 {len(chars)} 个唯一字符")
 
     print("\n[2/3] 渲染并自检 ...")
-    glyphs, size = build_glyph_table(font_path, chars)
+    glyphs, size, font_path = build_glyph_table(fonts, chars)
 
     print("\n[3/3] 写出字库 ...")
     if check_only:
