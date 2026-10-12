@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ===============================================================================
- gen_font.py —— 扫描源码中的中文字符，自动生成 16x16 点阵字库头文件
+ gen_font.py —— 扫描源码里的中文，生成 16x16 点阵字库头文件
 
  用法：
-     python gen_font.py
+     python gen_font.py            # 生成 src/cn_font_data.h
+     python gen_font.py --check    # 只自检，不写文件
 
- 在 PlatformIO 编译前自动运行（通过 extra_script.py 的预构建钩子）。
+ 编译前由 extra_script.py 自动调用。
 
- 原理：
-     1. 扫描 src/ 和 include/ 下所有 .c / .h 文件，提取唯一中文字符
-     2. 用系统自带的中文字体（宋体/微软雅黑等）渲染为 16x16 单色位图
-     3. 转为 SSD1306 列序格式（每字节 = 一列 8 像素）写入 cn_font_data.h
-     4. 同时生成 Unicode 码点 -> 索引的映射表，C 代码用二分查找
+ 设计要点（这一版重写的核心）
+ ---------------------------------------------------------------------------
+ 1. **每个字的墨迹硬限制在 15x15 以内，并居中放进 16x16 格子。**
+    这是修“菜单行与行之间出现被裁掉的笔画”的关键：
+    旧版允许字模长到 16 像素高、偏移算成 0，于是 16/17 像素高的字会溢出
+    到下一行（行距只有 16 像素），屏上就出现半截笔画、鬼影。
+    现在留出上下左右各至少半个像素的余量，**物理上不可能越界**。
+
+ 2. 字号自动挑选：从大往小试，取“所有字都能装进 15x15”的那个最大字号，
+    尽量把格子填满、笔画饱满（13 号偏细，字距显得空）。
+
+ 3. 生成后自带断言自检，任何字越界都会直接报错退出，而不是悄悄产出坏字库。
+
+ 4. 位序与 SSD1306 水平寻址一致：
+        data[0..15]  = 上半页（行 0..7 ），每字节 bit0 = 该列最上面的像素
+        data[16..31] = 下半页（行 8..15）
+    oled.c 直接把这 32 字节 memcpy 进帧缓冲即可，无需转置。
 
  依赖： pip install pillow
 ===============================================================================
 """
+
 import os
 import re
 import sys
@@ -25,27 +40,29 @@ from pathlib import Path
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
-    print("╔══════════════════════════════════════════════════════════════╗")
-    print("║  缺少 Pillow 库，请先安装：                                  ║")
-    print("║      pip install pillow                                     ║")
-    print("╚══════════════════════════════════════════════════════════════╝")
+    print("缺少 Pillow，请先安装： pip install pillow")
     sys.exit(1)
 
 # ============================ 配置 ===========================================
 
-SRC_DIRS = ["src", "include"]       # 扫描哪些目录
-OUTPUT_FILE = "src/cn_font_data.h"  # 输出头文件
-FONT_SIZE = 13                      # 字号（13pt 紧凑但不裁剪，Marlin 风格）
-FONT_PATH = None                    # None = 自动查找系统字体
+SRC_DIRS = ["src", "include"]        # 扫描哪些目录里的字符串字面量
+OUTPUT_FILE = "src/cn_font_data.h"   # 输出
+FONT_PATH = None                     # None = 自动查找；也可写死一个 .ttf/.ttc
 
-# 备选字体列表（Windows 按优先级排列）
+CELL = 16                            # 单字格子尺寸（像素）
+INK_MAX = 15                         # 墨迹最大尺寸：留 1 像素余量，绝不越界
+
+# 自动挑选字号时的候选（从大到小）
+FONT_SIZE_CANDIDATES = [16, 15, 14, 13, 12]
+
+# 备选字体（Windows 优先）
 _WIN_FONTS = [
-    "C:/Windows/Fonts/simsun.ttc",       # 宋体（最标准的点阵风格）
+    "C:/Windows/Fonts/simsun.ttc",       # 宋体：点阵风格最标准
     "C:/Windows/Fonts/simhei.ttf",       # 黑体
     "C:/Windows/Fonts/msyh.ttc",         # 微软雅黑
     "C:/Windows/Fonts/Deng.ttf",         # 等线
+    "C:/Windows/Fonts/simsunb.ttf",
 ]
-
 _LINUX_FONTS = [
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
@@ -53,46 +70,37 @@ _LINUX_FONTS = [
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 ]
 
-# ============================ 字体查找 ========================================
 
 def find_chinese_font():
-    """自动查找系统可用的中文字体"""
+    """自动查找系统中文字体"""
     import platform
 
-    candidates = _WIN_FONTS if platform.system() == "Windows" else _LINUX_FONTS
-
-    for f in candidates:
+    for f in (_WIN_FONTS if platform.system() == "Windows" else _LINUX_FONTS):
         if os.path.exists(f):
             return f
-
-    # 最后尝试用 PIL 的默认字体（通常不支持中文，但试试无妨）
-    print("警告: 未找到系统中文字体，尝试使用 PIL 默认字体（可能无法渲染中文）")
     return None
 
-# ============================ 字符扫描 ========================================
+
+# ============================ 字符扫描 =======================================
 
 def find_chinese_chars(project_root, dirs):
     """
-    扫描指定目录下所有 .c / .h 文件中的字符串字面量，
-    提取其中出现的唯一中文字符（仅限 OLED 显示用的，不是注释里的）。
-
-    返回排序后的字符列表。
+    扫描 .c/.h 里**字符串字面量**中的中文/全角标点，返回排序后的唯一字符列表。
+    注释里的中文不算，代码中的中文标识符也不算。
     """
     chars = set()
-    # 匹配 CJK 统一汉字 + 中文标点
-    cn_pattern = re.compile(r'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]')
-    # 匹配 C 字符串字面量："..."  ，处理转义引号
-    str_pattern = re.compile(r'"((?:[^"\\]|\\.)*)"')
+    cn = re.compile(r'[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
+    lit = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
     for d in dirs:
-        full_dir = os.path.join(project_root, d)
-        if not os.path.isdir(full_dir):
+        full = os.path.join(project_root, d)
+        if not os.path.isdir(full):
             continue
-        for root, _, files in os.walk(full_dir):
-            for f in files:
-                if not f.endswith(('.c', '.h')):
+        for root, _, files in os.walk(full):
+            for fn in files:
+                if not fn.endswith((".c", ".h")):
                     continue
-                path = os.path.join(root, f)
+                path = os.path.join(root, fn)
                 try:
                     with open(path, "r", encoding="utf-8") as fp:
                         content = fp.read()
@@ -100,78 +108,162 @@ def find_chinese_chars(project_root, dirs):
                     print(f"  警告: 读取 {path} 失败: {e}")
                     continue
 
-                # 只提取字符串字面量里的中文（忽略注释和代码中的中文标识符）
-                file_chars = set()
-                for m in str_pattern.finditer(content):
-                    s = m.group(1)
-                    file_chars.update(cn_pattern.findall(s))
-
-                if file_chars:
-                    rel = os.path.relpath(path, project_root)
-                    print(f"  {rel}: {len(file_chars)} 个显示用汉字")
-                chars.update(file_chars)
+                found = set()
+                for m in lit.finditer(content):
+                    found.update(cn.findall(m.group(1)))
+                if found:
+                    print(f"  {os.path.relpath(path, project_root)}: {len(found)} 个显示用字符")
+                chars.update(found)
 
     return sorted(chars)
 
-# ============================ 位图渲染 ========================================
 
-def render_char(char, font, size=16):
-    """
-    渲染单个汉字为 16x16 单色位图，返回 32 字节的 SSD1306 列序数据。
+# ============================ 字形渲染 =======================================
 
-    先在一个大画布上渲染字符，计算实际包围盒后居中放入 16x16 输出。
-    这样无论 FONT_SIZE 多大，字形都不会被裁剪，且在格子内居中。
-
-    SSD1306 列序格式（对应 SSD1306 水平寻址模式）：
-        前 16 字节 = 列 0..15 的 上半页（行 0..7），每字节 bit0=最上像素
-        后 16 字节 = 列 0..15 的 下半页（行 8..15），每字节 bit0=最上像素
-    """
-    inner = 20
-    canvas = Image.new("L", (inner, inner), 0)
-    draw = ImageDraw.Draw(canvas)
-    draw.text((0, 0), char, font=font, fill=255)
-
+def render_ink(ch, font):
+    """把字符渲染出来，返回 (灰度图, 墨迹包围盒)。灰度图带一点抗锯齿。"""
+    pad = 6
+    canvas = Image.new("L", (CELL * 2 + pad * 2, CELL * 2 + pad * 2), 0)
+    ImageDraw.Draw(canvas).text((pad, pad), ch, font=font, fill=255)
     bbox = canvas.getbbox()
     if bbox is None:
-        return bytes(32)
+        return None, None
+    return canvas.crop(bbox), bbox
 
-    l, t, r, b = bbox
-    gw = r - l
-    gh = b - t
-    if gw <= 0 or gh <= 0:
-        return bytes(32)
 
-    ox = (size - gw) // 2 - l
-    oy = (size - gh) // 2 - t
+def glyph_from_ink(ink):
+    """
+    把墨迹图**按比例压进 INK_MAX x INK_MAX 以内并居中**，再转成 32 字节列序点阵。
 
-    img = Image.new("L", (size, size), 0)
-    img.paste(canvas.crop(bbox), (ox, oy))
+    返回 (bytes32, (w, h))；如果墨迹为空返回 (None, None)。
+    """
+    iw, ih = ink.size
+    if iw <= 0 or ih <= 0:
+        return None, None
 
+    # 等比缩放到不超过 INK_MAX（只缩不放，保持笔画锐利）
+    scale = min(1.0, INK_MAX / iw, INK_MAX / ih)
+    if scale < 1.0:
+        nw = max(1, int(round(iw * scale)))
+        nh = max(1, int(round(ih * scale)))
+        ink = ink.resize((nw, nh), Image.LANCZOS)
+        iw, ih = nw, nh
+
+    # 先居中放进 INK_MAX x INK_MAX 的“安全盒”，再把安全盒居中放进 16x16 格子。
+    # 这样上下左右都至少留出 (CELL-INK_MAX)/2 的余量，笔画不会贴边、
+    # 也不会有一行字紧贴着下一行字。
+    box = Image.new("L", (INK_MAX, INK_MAX), 0)
+    box.paste(ink, ((INK_MAX - iw) // 2, (INK_MAX - ih) // 2))
+
+    cell = Image.new("L", (CELL, CELL), 0)
+    off = (CELL - INK_MAX) // 2
+    cell.paste(box, (off, off))
+
+    # 二值化 -> SSD1306 列序
+    px = cell.load()
     data = bytearray(32)
-    for col in range(16):
-        byte_top = 0
-        byte_bot = 0
+    for col in range(CELL):
+        top = 0
+        bot = 0
         for row in range(8):
-            if img.getpixel((col, row)) > 128:
-                byte_top |= 1 << row
-            if img.getpixel((col, row + 8)) > 128:
-                byte_bot |= 1 << row
-        data[col] = byte_top
-        data[col + 16] = byte_bot
+            if px[col, row] > 128:
+                top |= 1 << row
+            if px[col, row + 8] > 128:
+                bot |= 1 << row
+        data[col] = top
+        data[col + CELL] = bot
+    return bytes(data), (iw, ih)
 
-    return bytes(data)
 
-# ============================ 头文件生成 ======================================
+def ink_extent(data):
+    """从 32 字节点阵反算墨迹范围，用于自检。返回 (x0,x1,y0,y1) 或 None。"""
+    xs = []
+    ys = []
+    for col in range(CELL):
+        top = data[col]
+        bot = data[col + CELL]
+        for bit in range(8):
+            if top & (1 << bit):
+                xs.append(col)
+                ys.append(bit)
+            if bot & (1 << bit):
+                xs.append(col)
+                ys.append(bit + 8)
+    if not xs:
+        return None
+    return min(xs), max(xs), min(ys), max(ys)
 
-def generate_header(chars, font_path, output_path):
-    """生成 cn_font_data.h"""
-    font = ImageFont.truetype(font_path, FONT_SIZE)
 
+def choose_font(font_path, chars):
+    """
+    从大到小挑字号：要求**所有**字的墨迹压进格子后都在 15x15 以内。
+    返回 (font, size, glyphs_dict, stats)。
+    """
+    best = None
+    for size in FONT_SIZE_CANDIDATES:
+        font = ImageFont.truetype(font_path, size)
+        glyphs = {}
+        ok = True
+        worst = 0
+        for ch in chars:
+            ink, _ = render_ink(ch, font)
+            data, (w, h) = glyph_from_ink(ink) if ink is not None else (None, None)
+            if data is None:
+                data = bytes(32)
+                w = h = 0
+            glyphs[ch] = data
+            worst = max(worst, w, h)
+            if w > INK_MAX or h > INK_MAX:
+                ok = False
+                break
+        if ok:
+            best = (font, size, glyphs, worst)
+            break
+        print(f"  字号 {size}: 有字模超过 {INK_MAX}x{INK_MAX}（最大 {worst}），试更小的字号")
+
+    if best is None:
+        raise RuntimeError("没有任何候选字号能让所有字模装进格子")
+
+    return best
+
+
+# ============================ 生成与自检 =====================================
+
+def build_glyph_table(font_path, chars, verbose=True):
+    """生成 {字符: 32 字节} 表，并做越界自检。"""
+    font, size, glyphs, worst = choose_font(font_path, chars)
+    if verbose:
+        print(f"  采用字号: {size}（最大墨迹 {worst}x{worst}，上限 {INK_MAX}）")
+
+    problems = []
+    for ch in chars:
+        ext = ink_extent(glyphs[ch])
+        if ext is None:
+            problems.append((ch, "空字模"))
+            continue
+        x0, x1, y0, y1 = ext
+        if x1 - x0 + 1 > INK_MAX or y1 - y0 + 1 > INK_MAX:
+            problems.append((ch, f"墨迹 {x1-x0+1}x{y1-y0+1} 超出 {INK_MAX}x{INK_MAX}"))
+        if x0 < 0 or y0 < 0 or x1 > CELL - 1 or y1 > CELL - 1:
+            problems.append((ch, f"越界 x{x0}..{x1} y{y0}..{y1}"))
+
+    if problems:
+        for ch, why in problems:
+            print(f"  !! 自检失败: '{ch}' {why}")
+        raise RuntimeError(f"{len(problems)} 个字符未通过自检")
+
+    if verbose:
+        print(f"  自检通过: {len(chars)} 个字符全部在 {INK_MAX}x{INK_MAX} 以内")
+    return glyphs, size
+
+
+def write_header(chars, glyphs, size, font_path, output_path):
     lines = []
     lines.append("// ============================================================")
     lines.append("//  cn_font_data.h —— 自动生成，请勿手动编辑")
-    lines.append(f"//  扫描源码得到 {len(chars)} 个中文字符，16x16 列序点阵")
-    lines.append(f"//  生成时间: {__import__('datetime').datetime.now()}")
+    lines.append(f"//  字体: {os.path.basename(font_path)}  字号: {size}")
+    lines.append(f"//  {len(chars)} 个字符，每个 16x16（墨迹限制 {INK_MAX}x{INK_MAX} 以内，保证不越界）")
+    lines.append("//  位序: [0..15] 上半页(行0..7)，[16..31] 下半页(行8..15)，bit0 = 最上像素")
     lines.append("// ============================================================")
     lines.append("")
     lines.append("#ifndef __CN_FONT_DATA_H")
@@ -179,84 +271,67 @@ def generate_header(chars, font_path, output_path):
     lines.append("")
     lines.append("#include <stdint.h>")
     lines.append("")
-    lines.append(f"/** 字库字符总数 */")
+    lines.append("/** 字库字符总数 */")
     lines.append(f"#define CN_FONT_COUNT  {len(chars)}U")
     lines.append("")
-    lines.append("/** 每个字符 32 字节：前 16 字节 = 上半页，后 16 字节 = 下半页 */")
+    lines.append("/** 单字点阵尺寸（与 oled.c 的行列步进一致） */")
+    lines.append(f"#define CN_FONT_CELL   {CELL}U")
+    lines.append("")
+    lines.append("/** 每个字符 32 字节 */")
     lines.append(f"static const uint8_t cn_font_glyph[{len(chars)}][32] = {{")
-
     for i, ch in enumerate(chars):
-        bitmap = render_char(ch, font)
-        hex_bytes = ", ".join(f"0x{b:02X}" for b in bitmap)
-        lines.append(f"    /* {i:3d} U+{ord(ch):04X} '{ch}' */ {{{hex_bytes}}},")
-
+        hexb = ", ".join(f"0x{b:02X}" for b in glyphs[ch])
+        lines.append(f"    /* {i:3d} U+{ord(ch):04X} '{ch}' */ {{{hexb}}},")
     lines.append("};")
     lines.append("")
-    lines.append("/** Unicode 码点 -> 字形索引（按码点升序排列，供二分查找） */")
+    lines.append("/** Unicode 码点 -> 字形下标（按码点升序，供二分查找） */")
     lines.append("typedef struct {")
-    lines.append("    uint16_t codepoint;  /**< Unicode 码点 */")
-    lines.append("    uint16_t index;      /**< cn_font_glyph 中的索引 */")
+    lines.append("    uint16_t codepoint;")
+    lines.append("    uint16_t index;")
     lines.append("} cn_font_entry_t;")
     lines.append("")
     lines.append(f"static const cn_font_entry_t cn_font_map[{len(chars)}] = {{")
-
     for i, ch in enumerate(chars):
         lines.append(f"    {{ 0x{ord(ch):04X}, {i} }},  /* '{ch}' */")
-
     lines.append("};")
     lines.append("")
     lines.append("#endif /* __CN_FONT_DATA_H */")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
-    print(f"\n  已生成 {output_path}（{len(chars)} 个汉字，{len(chars) * 32} 字节）")
 
-# ============================ main ============================================
+# ============================ main ===========================================
 
 def main():
-    project_root = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(project_root, OUTPUT_FILE)
+    check_only = "--check" in sys.argv
+    root = os.path.dirname(os.path.abspath(__file__))
+    out = os.path.join(root, OUTPUT_FILE)
 
-    # 1. 找字体
     font_path = FONT_PATH or find_chinese_font()
     if not font_path:
-        print("错误: 找不到任何中文字体，无法生成字库")
-        print("请手动设置 gen_font.py 顶部的 FONT_PATH 变量指向一个 .ttf/.ttc 文件")
+        print("错误: 找不到中文字体，请在 gen_font.py 顶部写死 FONT_PATH")
         sys.exit(1)
     print(f"字体: {font_path}")
 
-    # 2. 扫描中文字符
-    print("\n扫描源码中的中文字符...")
-    chars = find_chinese_chars(project_root, SRC_DIRS)
-
+    print("\n[1/3] 扫描源码字符串里的中文 ...")
+    chars = find_chinese_chars(root, SRC_DIRS)
     if not chars:
-        print("未找到任何中文字符，生成空字库占位文件")
-        # 生成一个空壳头文件，让编译不报错
-        dummy = [
-            "#ifndef __CN_FONT_DATA_H",
-            "#define __CN_FONT_DATA_H",
-            "#include <stdint.h>",
-            "#define CN_FONT_COUNT  0U",
-            "static const uint8_t cn_font_glyph[1][32] = {{0}};",
-            "typedef struct { uint16_t codepoint; uint8_t index; } cn_font_entry_t;",
-            "static const cn_font_entry_t cn_font_map[1] = {{0, 0}};",
-            "#endif",
-        ]
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(dummy) + "\n")
-        print(f"  已生成空字库 {output_path}")
-        return
+        print("  没扫到任何中文字符，生成占位字库")
+        chars = ["中"]
+    print(f"  共 {len(chars)} 个唯一字符")
 
-    print(f"\n共找到 {len(chars)} 个唯一字符: {''.join(chars)}")
+    print("\n[2/3] 渲染并自检 ...")
+    glyphs, size = build_glyph_table(font_path, chars)
 
-    # 3. 渲染并生成头文件
-    print("\n渲染字模...")
-    generate_header(chars, font_path, output_path)
+    print("\n[3/3] 写出字库 ...")
+    if check_only:
+        print("  --check 模式：只自检，不写文件")
+    else:
+        write_header(chars, glyphs, size, font_path, out)
+        print(f"  已写出 {OUTPUT_FILE}（{len(chars)} 字，{len(chars) * 32} 字节）")
+    print("\n完成。")
 
-    print("\n完成！")
 
 if __name__ == "__main__":
     main()
