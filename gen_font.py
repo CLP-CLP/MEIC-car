@@ -35,7 +35,7 @@ except ImportError:
 
 SRC_DIRS = ["src", "include"]       # 扫描哪些目录
 OUTPUT_FILE = "src/cn_font_data.h"  # 输出头文件
-FONT_SIZE = 12                      # 字号（点数，12pt 更紧凑，Marlin 风格）
+FONT_SIZE = 13                      # 字号（13pt 紧凑但不裁剪，Marlin 风格）
 FONT_PATH = None                    # None = 自动查找系统字体
 
 # 备选字体列表（Windows 按优先级排列）
@@ -119,22 +119,38 @@ def render_char(char, font, size=16):
     """
     渲染单个汉字为 16x16 单色位图，返回 32 字节的 SSD1306 列序数据。
 
+    先在一个大画布上渲染字符，计算实际包围盒后居中放入 16x16 输出。
+    这样无论 FONT_SIZE 多大，字形都不会被裁剪，且在格子内居中。
+
     SSD1306 列序格式（对应 SSD1306 水平寻址模式）：
         前 16 字节 = 列 0..15 的 上半页（行 0..7），每字节 bit0=最上像素
         后 16 字节 = 列 0..15 的 下半页（行 8..15），每字节 bit0=最上像素
-
-    绘制时直接 memcpy 到帧缓冲对应位置即可，无需转置。
     """
-    img = Image.new("L", (size, size), 0)  # 黑底
-    draw = ImageDraw.Draw(img)
-
-    # 渲染字符，尝试让字形居中
+    inner = 20
+    canvas = Image.new("L", (inner, inner), 0)
+    draw = ImageDraw.Draw(canvas)
     draw.text((0, 0), char, font=font, fill=255)
+
+    bbox = canvas.getbbox()
+    if bbox is None:
+        return bytes(32)
+
+    l, t, r, b = bbox
+    gw = r - l
+    gh = b - t
+    if gw <= 0 or gh <= 0:
+        return bytes(32)
+
+    ox = (size - gw) // 2 - l
+    oy = (size - gh) // 2 - t
+
+    img = Image.new("L", (size, size), 0)
+    img.paste(canvas.crop(bbox), (ox, oy))
 
     data = bytearray(32)
     for col in range(16):
-        byte_top = 0  # 行 0..7
-        byte_bot = 0  # 行 8..15
+        byte_top = 0
+        byte_bot = 0
         for row in range(8):
             if img.getpixel((col, row)) > 128:
                 byte_top |= 1 << row
@@ -179,7 +195,7 @@ def generate_header(chars, font_path, output_path):
     lines.append("/** Unicode 码点 -> 字形索引（按码点升序排列，供二分查找） */")
     lines.append("typedef struct {")
     lines.append("    uint16_t codepoint;  /**< Unicode 码点 */")
-    lines.append("    uint8_t  index;      /**< cn_font_glyph 中的索引 */")
+    lines.append("    uint16_t index;      /**< cn_font_glyph 中的索引 */")
     lines.append("} cn_font_entry_t;")
     lines.append("")
     lines.append(f"static const cn_font_entry_t cn_font_map[{len(chars)}] = {{")

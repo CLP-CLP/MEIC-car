@@ -382,7 +382,7 @@ static uint8_t _中文_取码点(const char *s, uint16_t *码点)
   * @note   占用 (列, 行)~(列+1, 行+1) 共 2×2 个 8×8 单元格；
   *         超出屏幕范围则直接返回不画。
   */
-static void _中文_画汉字(uint8_t 列, uint8_t 行, uint8_t 字形索引)
+static void _中文_画汉字(uint8_t 列, uint8_t 行, uint16_t 字形索引)
 {
     const uint8_t *字形;
     uint8_t *buf;
