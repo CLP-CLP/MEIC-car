@@ -4,8 +4,8 @@
  * @brief   L298N 双直流电机驱动（方向 IO + PWM 调速）
  *
  *  接线（L298N）
- *      左电机 A：IN1 = PB0    IN2 = PB1    ENA = PA6（TIM3_CH1）
- *      右电机 B：IN3 = PB10   IN4 = PB11   ENB = PA7（TIM3_CH2）
+ *      左电机：IN3 = PB10   IN4 = PB11   ENB = PA7（TIM3_CH2）
+ *      右电机：IN1 = PB0    IN2 = PB1    ENA = PA6（TIM3_CH1）
  *
  *  控制原理
  *      IN1/IN2 决定方向，ENA/ENB 用 PWM 决定转速：
@@ -56,19 +56,19 @@ extern "C" {
 #define 电机_左_方向取反        1
 #define 电机_右_方向取反        1
 
-/* --- 左电机（L298N 的 A 通道）--- */
+/* --- 左电机（L298N 的 B 通道：PB10/PB11, PA7/TIM3_CH2）--- */
 #define 电机_左_IN1_端口        GPIOB
-#define 电机_左_IN1_引脚        GPIO_PIN_0
+#define 电机_左_IN1_引脚        GPIO_PIN_10
 #define 电机_左_IN2_端口        GPIOB
-#define 电机_左_IN2_引脚        GPIO_PIN_1
-#define 电机_左_PWM通道         TIM_CHANNEL_1      /* PA6 = TIM3_CH1 = ENA */
+#define 电机_左_IN2_引脚        GPIO_PIN_11
+#define 电机_左_PWM通道         TIM_CHANNEL_2      /* PA7 = TIM3_CH2 = ENB */
 
-/* --- 右电机（L298N 的 B 通道）--- */
+/* --- 右电机（L298N 的 A 通道：PB0/PB1, PA6/TIM3_CH1）--- */
 #define 电机_右_IN1_端口        GPIOB
-#define 电机_右_IN1_引脚        GPIO_PIN_10
+#define 电机_右_IN1_引脚        GPIO_PIN_0
 #define 电机_右_IN2_端口        GPIOB
-#define 电机_右_IN2_引脚        GPIO_PIN_11
-#define 电机_右_PWM通道         TIM_CHANNEL_2      /* PA7 = TIM3_CH2 = ENB */
+#define 电机_右_IN2_引脚        GPIO_PIN_1
+#define 电机_右_PWM通道         TIM_CHANNEL_1      /* PA6 = TIM3_CH1 = ENA */
 
 /** PWM 定时器：TIM3，APB1 定时器时钟 = 72 MHz */
 #define 电机_PWM定时器          TIM3
