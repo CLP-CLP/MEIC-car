@@ -61,6 +61,15 @@ void 显示_画字符(uint8_t 列, uint8_t 行, char 字符);
   */
 void 显示_画字符串(uint8_t 列, uint8_t 行, const char *串);
 
+/**
+  * @brief  在字符网格 (列, 行) 起画混合中英文的 UTF-8 字符串
+  * @note   16×16 中文字符占 2 列 × 2 行（8×8 网格坐标）；
+  *         ASCII 字符仍按 8×8 绘制，占 1 列 × 1 行；
+  *         超出右边界自动截断。
+  *         汉字字形数据由编译前自动运行的 gen_font.py 生成在 cn_font_data.h 中。
+  */
+void 显示_画中文(uint8_t 列, uint8_t 行, const char *中英文字符串);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,9 @@
 
 #include <string.h>
 
+/* ---- 自动生成的中文字库（gen_font.py 编译前生成）---- */
+#include "cn_font_data.h"
+
 /* ============================== 私有变量 =================================== */
 
 static I2C_HandleTypeDef 显示_I2C;
@@ -316,5 +319,131 @@ void 显示_画字符串(uint8_t 列, uint8_t 行, const char *串)
             break;
         }
         串++;
+    }
+}
+
+/* ============================== 中文绘制 =================================== */
+
+/**
+  * @brief  二分查找 Unicode 码点对应的字形索引
+  * @retval 索引值（0 ~ CN_FONT_COUNT-1），找不到返回 -1
+  */
+static int16_t _中文_查索引(uint16_t 码点)
+{
+    int16_t lo = 0;
+    int16_t hi = (int16_t)(CN_FONT_COUNT - 1U);
+
+    while (lo <= hi)
+    {
+        int16_t mid = (int16_t)(((uint16_t)lo + (uint16_t)hi) >> 1);
+        uint16_t val = cn_font_map[mid].codepoint;
+
+        if (码点 < val) {
+            hi = (int16_t)(mid - 1);
+        } else if (码点 > val) {
+            lo = (int16_t)(mid + 1);
+        } else {
+            return mid;
+        }
+    }
+    return -1;
+}
+
+/**
+  * @brief  从 UTF-8 字符串中解析一个 Unicode 码点
+  * @retval 消耗的字节数（1~3），解析失败返回 1
+  */
+static uint8_t _中文_取码点(const char *s, uint16_t *码点)
+{
+    uint8_t c = (uint8_t)*s;
+
+    if (c < 0x80U) {
+        *码点 = (uint16_t)c;
+        return 1U;
+    }
+    if ((c & 0xE0U) == 0xC0U) {
+        *码点 = (uint16_t)(((uint16_t)(c & 0x1FU) << 6)
+                          | (uint16_t)((uint8_t)s[1] & 0x3FU));
+        return 2U;
+    }
+    if ((c & 0xF0U) == 0xE0U) {
+        *码点 = (uint16_t)(((uint16_t)(c & 0x0FU) << 12)
+                          | ((uint16_t)((uint8_t)s[1] & 0x3FU) << 6)
+                          |  (uint16_t)((uint8_t)s[2] & 0x3FU));
+        return 3U;
+    }
+
+    *码点 = 0U;
+    return 1U;
+}
+
+/**
+  * @brief  在字符网格 (列, 行) 绘制一个 16×16 中文字符
+  * @note   占用 (列, 行)~(列+1, 行+1) 共 2×2 个 8×8 单元格；
+  *         超出屏幕范围则直接返回不画。
+  */
+static void _中文_画汉字(uint8_t 列, uint8_t 行, uint8_t 字形索引)
+{
+    const uint8_t *字形;
+    uint8_t *buf;
+    uint8_t c;
+
+    if ((列 + 1U) >= 显示_列数 || (行 + 1U) >= 显示_行数) {
+        return;
+    }
+
+    if (字形索引 >= CN_FONT_COUNT) {
+        return;
+    }
+
+    字形 = cn_font_glyph[字形索引];
+
+    /* 上半页（行 0..7）：16 字节，对应列 列..列+1 的 16 个像素列 */
+    buf = &显示_帧缓冲[行 * 显示_宽度 + 列 * 8U];
+    for (c = 0U; c < 16U; c++) {
+        buf[c] = 字形[c];
+    }
+
+    /* 下半页（行 8..15）：16 字节 */
+    buf = &显示_帧缓冲[(uint16_t)(行 + 1U) * 显示_宽度 + 列 * 8U];
+    for (c = 0U; c < 16U; c++) {
+        buf[c] = 字形[c + 16U];
+    }
+}
+
+/**
+  * @brief  在字符网格 (列, 行) 起画混合中英文的 UTF-8 字符串
+  * @note   中文字符（U+4E00~U+9FFF）以 16×16 绘制，占 2 列 × 2 行；
+  *         ASCII 字符以 8×8 绘制，占 1 列 × 1 行；
+  *         超出右边界自动截断。
+  */
+void 显示_画中文(uint8_t 列, uint8_t 行, const char *串)
+{
+    while (*串 != '\0')
+    {
+        uint16_t 码点;
+        uint8_t  步进 = _中文_取码点(串, &码点);
+
+        if (码点 < 0x80U)
+        {
+            /* ---- ASCII：8×8 ---- */
+            显示_画字符(列, 行, (char)码点);
+            列++;
+        }
+        else
+        {
+            /* ---- 中文：16×16 ---- */
+            int16_t idx = _中文_查索引(码点);
+            if (idx >= 0)
+            {
+                _中文_画汉字(列, 行, (uint8_t)idx);
+            }
+            列 = (uint8_t)(列 + 2U);
+        }
+
+        if (列 >= 显示_列数) {
+            break;
+        }
+        串 += 步进;
     }
 }

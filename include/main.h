@@ -37,7 +37,11 @@ extern "C" {
  *  PA11 / PA12  USB D- / D+，即虚拟串口                       见 vcp.h
  *  PA13 / PA14  SWD 调试口（SWDIO / SWCLK），不可占用
  *  PB0  / PB1   L298N IN1 / IN2（左电机方向）                 见 motor.h
+ *  PB6  / PB7   I2C1_SCL / SDA（OLED）                        见 oled.h
  *  PB10 / PB11  L298N IN3 / IN4（右电机方向）                 见 motor.h
+ *  PB12         上键（菜单光标上移）                           见 button.h
+ *  PB13         下键（菜单光标下移）                           见 button.h
+ *  PB14         确认键（短按=进入/执行，长按=返回）            见 button.h
  *  PC13         板载 LED
  * ========================================================================== */
 

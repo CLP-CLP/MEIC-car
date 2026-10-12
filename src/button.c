@@ -1,10 +1,11 @@
 /**
  ******************************************************************************
  * @file    button.c
- * @brief   单键输入：消抖 + 短按 / 长按 识别
+ * @brief   三键输入：消抖 + 短按 / 长按识别
  *
- *  短按：按下后 2 秒内松手        -> 按键_短按（选择）
- *  长按：按住满 2 秒              -> 按键_长按（确认）
+ *  上键(PB12) / 下键(PB13) : 短按 -> BTN_UP / BTN_DOWN
+ *  确认键(PB14)           : 2 秒内松手 -> BTN_SEL
+ *                           按住满 2 秒 -> BTN_BACK
  ******************************************************************************
  */
 
@@ -14,8 +15,21 @@
 
 /* ============================== 参数 ======================================= */
 
-/** 消抖时间（毫秒）：电平保持这么久才认为稳定 */
-#define 按键_消抖毫秒          20U
+#define DEBOUNCE_MS         20U         /* 消抖时间（毫秒） */
+
+/* ============================== 单键状态 =================================== */
+
+typedef struct
+{
+    uint16_t    pin;
+    uint8_t     stable;                 /* 消抖后的稳定状态：1 = 按下 */
+    uint8_t     last_raw;
+    uint32_t    change_tick;            /* 上次电平变化时刻 */
+    uint32_t    press_tick;             /* 按下时刻（长按计时） */
+    uint8_t     long_fired;             /* 长按事件是否已报 */
+} _key_t;
+
+static _key_t _keys[3];
 
 /* ============================== 初始化 ===================================== */
 
@@ -25,80 +39,97 @@ void 按键_初始化(void)
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    GPIO_InitStruct.Pin   = 按键_引脚;
+    GPIO_InitStruct.Pin   = BTN_UP_PIN | BTN_DOWN_PIN | BTN_SEL_PIN;
     GPIO_InitStruct.Mode  = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull  = GPIO_PULLUP;        /* 按下接 GND，松开内部上拉为高 */
+    GPIO_InitStruct.Pull  = GPIO_PULLUP;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(按键_端口, &GPIO_InitStruct);
+    HAL_GPIO_Init(BTN_PORT, &GPIO_InitStruct);
+
+    _keys[0].pin = BTN_UP_PIN;
+    _keys[1].pin = BTN_DOWN_PIN;
+    _keys[2].pin = BTN_SEL_PIN;
 }
 
 /* ============================== 事件读取 =================================== */
 
-/** 读按键原始电平：1 = 按下，0 = 松开 */
-static uint8_t 按键_读原始(void)
+/** 读单个按键原始电平：1 = 按下 */
+static uint8_t _read_raw(uint16_t pin)
 {
-    return (HAL_GPIO_ReadPin(按键_端口, 按键_引脚) == GPIO_PIN_RESET) ? 1U : 0U;
+    return (HAL_GPIO_ReadPin(BTN_PORT, pin) == GPIO_PIN_RESET) ? 1U : 0U;
 }
 
-按键_事件 按键_取事件(void)
+/**
+  * @brief  处理单个按键的状态机，返回事件
+  * @retval 0=无事件, 1=短按, 2=长按
+  */
+static uint8_t _key_process(_key_t *k)
 {
-    static uint8_t  稳定状态    = 0U;   /* 消抖后的稳定状态：1 = 按下 */
-    static uint8_t  上次原始    = 0U;
-    static uint32_t 变化时刻    = 0U;   /* 上次电平变化时刻（消抖用） */
-    static uint32_t 按下时刻    = 0U;   /* 本次按下的时刻（长按计时用） */
-    static uint8_t  长按已报     = 0U;   /* 长按事件是否已经报过 */
+    uint8_t  raw = _read_raw(k->pin);
+    uint32_t now = HAL_GetTick();
 
-    uint8_t  原始 = 按键_读原始();
-    uint32_t 现在 = HAL_GetTick();
-
-    /* 电平刚变化：重新开始计时消抖，本轮不报事件 */
-    if (原始 != 上次原始) {
-        上次原始 = 原始;
-        变化时刻 = 现在;
-        return 按键_无;
-    }
-
-    /* 还没稳定够消抖时间 */
-    if ((uint32_t)(现在 - 变化时刻) < 按键_消抖毫秒) {
-        return 按键_无;
-    }
-
-    /* ---------- 稳定状态没变：检查"长按" ---------- */
-    if (原始 == 稳定状态)
+    if (raw != k->last_raw)
     {
-        if ((稳定状态 != 0U) && (长按已报 == 0U)
-            && ((uint32_t)(现在 - 按下时刻) >= 按键_长按毫秒))
+        k->last_raw   = raw;
+        k->change_tick = now;
+        return 0;
+    }
+
+    if ((uint32_t)(now - k->change_tick) < DEBOUNCE_MS) {
+        return 0;
+    }
+
+    /* 稳定状态没变：检查长按 */
+    if (raw == k->stable)
+    {
+        if ((k->stable != 0U) && (k->long_fired == 0U)
+            && ((uint32_t)(now - k->press_tick) >= BTN_LONG_MS))
         {
-            长按已报 = 1U;
-            return 按键_长按;               /* 按住满 2 秒 -> 确认 */
+            k->long_fired = 1U;
+            return 2;                       /* 长按 */
         }
-        return 按键_无;
+        return 0;
     }
 
-    /* ---------- 稳定状态变了 ---------- */
+    /* 稳定状态变了 */
     {
-        uint8_t 刚按下   = 原始 & (uint8_t)(~稳定状态);
-        uint8_t 刚松开   = 稳定状态 & (uint8_t)(~原始);
+        uint8_t just_pressed  = raw & (uint8_t)(~k->stable);
+        uint8_t just_released = k->stable & (uint8_t)(~raw);
 
-        稳定状态 = 原始;
+        k->stable = raw;
 
-        if (刚按下 != 0U)
+        if (just_pressed != 0U)
         {
-            /* 刚按下：先不报，等松手（短按）或满 2 秒（长按） */
-            按下时刻 = 现在;
-            长按已报 = 0U;
-            return 按键_无;
+            k->press_tick = now;
+            k->long_fired = 0U;
+            return 0;
         }
 
-        if (刚松开 != 0U)
+        if (just_released != 0U)
         {
-            if (长按已报 == 0U) {
-                return 按键_短按;           /* 2 秒内松手 -> 短按，选择 */
+            if (k->long_fired == 0U) {
+                return 1;                   /* 短按 */
             }
-            长按已报 = 0U;                  /* 长按之后的松手：不再重复报 */
-            return 按键_无;
+            k->long_fired = 0U;
+            return 0;
         }
     }
 
-    return 按键_无;
+    return 0;
+}
+
+btn_event_t 按键_取事件(void)
+{
+    uint8_t r;
+
+    r = _key_process(&_keys[0]);
+    if (r == 1) return BTN_UP;
+
+    r = _key_process(&_keys[1]);
+    if (r == 1) return BTN_DOWN;
+
+    r = _key_process(&_keys[2]);
+    if (r == 1) return BTN_SEL;
+    if (r == 2) return BTN_BACK;
+
+    return BTN_NONE;
 }
