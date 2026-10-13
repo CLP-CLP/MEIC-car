@@ -334,7 +334,7 @@ static void 动作_原始值(void)
     }
 }
 
-/** 设置左电机速度：上/下键调速，电机实时转动观察效果，确认键退出并保存 */
+/** 设置左电机速度：按住上/下键连续增减，确认键保存退出 */
 static void 动作_电机前进(void)
 {
     int16_t 速度 = 灰度_左电机速度;
@@ -344,32 +344,33 @@ static void 动作_电机前进(void)
     {
         OLED_清屏();
         OLED_显示中文串(0, 0, "设置左电机");
-        (void)snprintf(行, sizeof(行), "速度: %3d%%", (int)速度);
-        OLED_显示ASCII串(0, 20, 行);
-        OLED_显示ASCII串(0, 36, "UP/DN  OK退出");
+        (void)snprintf(行, sizeof(行), "%3d%%", (int)速度);
+        OLED_显示ASCII串(52, 36, 行);
         OLED_刷新();
 
         电机_转速(电机_左, 速度);
 
         btn_event_t 事件 = 按键_取事件();
-        if (事件 == BTN_UP && 速度 < 100) {
-            速度 += 5;
-            灰度_左电机速度 = 速度;
-        } else if (事件 == BTN_DOWN && 速度 > 0) {
-            速度 -= 5;
-            灰度_左电机速度 = 速度;
-        } else if (事件 == BTN_SEL || 事件 == BTN_BACK) {
+        if (事件 == BTN_SEL || 事件 == BTN_BACK) {
             break;
         }
 
-        HAL_Delay(80U);
+        if (HAL_GPIO_ReadPin(BTN_PORT, BTN_UP_PIN) == GPIO_PIN_RESET && 速度 < 100) {
+            速度++;
+            灰度_左电机速度 = 速度;
+        } else if (HAL_GPIO_ReadPin(BTN_PORT, BTN_DOWN_PIN) == GPIO_PIN_RESET && 速度 > 0) {
+            速度--;
+            灰度_左电机速度 = 速度;
+        }
+
+        HAL_Delay(20U);
     }
 
     电机_停止(电机_左);
     灰度_保存电机设置();
 }
 
-/** 设置右电机速度：上/下键调速，电机实时转动观察效果，确认键退出并保存 */
+/** 设置右电机速度：按住上/下键连续增减，确认键保存退出 */
 static void 动作_电机后退(void)
 {
     int16_t 速度 = 灰度_右电机速度;
@@ -379,32 +380,33 @@ static void 动作_电机后退(void)
     {
         OLED_清屏();
         OLED_显示中文串(0, 0, "设置右电机");
-        (void)snprintf(行, sizeof(行), "速度: %3d%%", (int)速度);
-        OLED_显示ASCII串(0, 20, 行);
-        OLED_显示ASCII串(0, 36, "UP/DN  OK退出");
+        (void)snprintf(行, sizeof(行), "%3d%%", (int)速度);
+        OLED_显示ASCII串(52, 36, 行);
         OLED_刷新();
 
         电机_转速(电机_右, 速度);
 
         btn_event_t 事件 = 按键_取事件();
-        if (事件 == BTN_UP && 速度 < 100) {
-            速度 += 5;
-            灰度_右电机速度 = 速度;
-        } else if (事件 == BTN_DOWN && 速度 > 0) {
-            速度 -= 5;
-            灰度_右电机速度 = 速度;
-        } else if (事件 == BTN_SEL || 事件 == BTN_BACK) {
+        if (事件 == BTN_SEL || 事件 == BTN_BACK) {
             break;
         }
 
-        HAL_Delay(80U);
+        if (HAL_GPIO_ReadPin(BTN_PORT, BTN_UP_PIN) == GPIO_PIN_RESET && 速度 < 100) {
+            速度++;
+            灰度_右电机速度 = 速度;
+        } else if (HAL_GPIO_ReadPin(BTN_PORT, BTN_DOWN_PIN) == GPIO_PIN_RESET && 速度 > 0) {
+            速度--;
+            灰度_右电机速度 = 速度;
+        }
+
+        HAL_Delay(20U);
     }
 
     电机_停止(电机_右);
     灰度_保存电机设置();
 }
 
-/** 设置最低PWM：调整死区补偿的最低转动占空比，实时生效并保存 */
+/** 设置最低PWM：按住上/下键连续增减，确认键保存退出 */
 static void 动作_电机左转(void)
 {
     uint8_t 最低 = 灰度_最低PWM;
@@ -414,25 +416,26 @@ static void 动作_电机左转(void)
     {
         OLED_清屏();
         OLED_显示中文串(0, 0, "设置最低PWM");
-        (void)snprintf(行, sizeof(行), "值: %3u%%", (unsigned)最低);
-        OLED_显示ASCII串(0, 20, 行);
-        OLED_显示ASCII串(0, 36, "UP/DN  OK确认");
+        (void)snprintf(行, sizeof(行), "%3u%%", (unsigned)最低);
+        OLED_显示ASCII串(52, 36, 行);
         OLED_刷新();
 
         btn_event_t 事件 = 按键_取事件();
-        if (事件 == BTN_UP && 最低 < 100U) {
-            最低 += 5U;
-            电机_设置最小占空比(最低);
-            灰度_最低PWM = 最低;
-        } else if (事件 == BTN_DOWN && 最低 > 0U) {
-            最低 -= 5U;
-            电机_设置最小占空比(最低);
-            灰度_最低PWM = 最低;
-        } else if (事件 == BTN_SEL || 事件 == BTN_BACK) {
+        if (事件 == BTN_SEL || 事件 == BTN_BACK) {
             break;
         }
 
-        HAL_Delay(80U);
+        if (HAL_GPIO_ReadPin(BTN_PORT, BTN_UP_PIN) == GPIO_PIN_RESET && 最低 < 100U) {
+            最低++;
+            电机_设置最小占空比(最低);
+            灰度_最低PWM = 最低;
+        } else if (HAL_GPIO_ReadPin(BTN_PORT, BTN_DOWN_PIN) == GPIO_PIN_RESET && 最低 > 0U) {
+            最低--;
+            电机_设置最小占空比(最低);
+            灰度_最低PWM = 最低;
+        }
+
+        HAL_Delay(20U);
     }
 
     灰度_保存电机设置();
