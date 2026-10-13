@@ -18,7 +18,7 @@ def _run_gen_font(source, target, env):
     print("  gen_font.py: 扫描中文 → 生成 16x16 字库 ...")
     print("==============================================")
     result = subprocess.run(
-        [sys.executable, script],
+        ["python", script],
         cwd=env.subst("$PROJECT_DIR"),
         capture_output=False,
     )
