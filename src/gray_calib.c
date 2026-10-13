@@ -29,15 +29,19 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "gray_calib.h"
+#include "board.h"          /* LED_ON / LED_OFF：校准全程用板载 LED 给信号 */
+#include "button.h"         /* 手动校准：确认键采点、长按取消 */
 #include "ir_sensor.h"
 #include "motor.h"
+#include "oled.h"           /* 手动校准：屏幕提示 */
+#include "oled_text.h"      /* 界面文案集中表 */
 
 #include <stdio.h>
 #include <string.h>
 
 /* ============================== 记录布局 =================================== */
 
-#define 灰度_记录半字数         18U
+#define 灰度_记录半字数         19U
 
 #define 记录位_魔数             0U
 #define 记录位_上电次数         1U
@@ -47,8 +51,9 @@
 #define 记录位_左电机速度       13U
 #define 记录位_右电机速度       14U
 #define 记录位_最低PWM          15U
-#define 记录位_保留             16U
-#define 记录位_校验             17U
+#define 记录位_车库40毫秒       16U   /* 40 cm 车库跑出来的时间，见 main.c 的车库时间标定 */
+#define 记录位_车库25毫秒       17U   /* 25 cm 车库跑出来的时间 */
+#define 记录位_校验             18U
 
 #define 记录标志_已校准         1U
 
@@ -208,6 +213,30 @@ static void 灰度_清上电次数(void)
     记录[记录位_上电次数] = 0U;
     记录[记录位_校验]     = 灰度_算校验(记录);
     (void)灰度_写记录(记录);
+}
+
+/**
+  * @brief  把当前的阈值/电机设置铺成一条完整记录（魔数、校验都填好）
+  * @note   用于"Flash 里还没有有效记录，但用户要先存车库时间"的场合：
+  *         这样不会因为记录不存在就写不进东西，也不会写进去一条垃圾。
+  */
+static void 灰度_铺默认记录(uint16_t *记录)
+{
+    uint16_t i;
+
+    memset(记录, 0, sizeof(uint16_t) * 灰度_记录半字数);
+
+    记录[记录位_魔数] = 灰度_魔数;
+
+    for (i = 0U; i < 巡线_路数; i++)
+    {
+        记录[记录位_阈值首 + i]   = 灰度_默认各路阈值;
+        记录[记录位_强阈值首 + i] = 灰度_默认各路强阈值;
+    }
+
+    记录[记录位_左电机速度] = (uint16_t)灰度_默认左电机速度;
+    记录[记录位_右电机速度] = (uint16_t)灰度_默认右电机速度;
+    记录[记录位_最低PWM]    = 灰度_默认最低PWM;
 }
 
 static uint16_t 灰度_算校验(const uint16_t *记录)
@@ -487,7 +516,287 @@ void 灰度_校准(void)
     校准进行中 = 0U;
 }
 
+/* ============================== 手动两点校准 =============================== */
+
+/** 采一组五路平均值：先让车停稳，再连采 灰度_手动采样次数 次求平均 */
+static void 灰度_采平均(uint16_t *结果)
+{
+    uint32_t 累加[巡线_路数];
+    uint16_t i;
+    uint16_t k;
+
+    /* 刚按完确认键，手还搭在车上、车可能还在晃，先等它稳下来。
+       这 300 ms 也是给用户看一眼"正在采样"的机会。 */
+    OLED_显示中文串(0, 32, 文本_采样中);
+    OLED_刷新();
+    HAL_Delay(300U);
+
+    for (i = 0U; i < 巡线_路数; i++) {
+        累加[i] = 0U;
+    }
+
+    for (k = 0U; k < 灰度_手动采样次数; k++)
+    {
+        for (i = 0U; i < 巡线_路数; i++) {
+            累加[i] += (uint32_t)巡线_读取第几路(i);
+        }
+        HAL_Delay(灰度_手动采样间隔毫秒);
+    }
+
+    for (i = 0U; i < 巡线_路数; i++) {
+        结果[i] = (uint16_t)(累加[i] / 灰度_手动采样次数);
+    }
+}
+
+/** 画一屏四行提示（第一行是标题，最后一行固定是"长按=取消"）
+    手动校准 / 车库时间标定共用 */
+void 灰度_提示屏(const char *标题, const char *第一行, const char *第二行)
+{
+    OLED_清屏();
+    OLED_显示中文串(0, 0,  标题);
+    OLED_显示中文串(0, 16, 第一行);
+    OLED_显示中文串(0, 32, 第二行);
+    OLED_显示中文串(0, 48, 文本_长按等于取消);
+    OLED_刷新();
+}
+
+/**
+  * @brief  等一次按键（手动校准 / 车库时间标定共用）
+  * @retval 1 = 按了确认短按；0 = 长按确认（放弃）
+  * @note   按键状态机要求被反复轮询（消抖 20 ms、长按 2 s 都靠它自己计时），
+  *         所以这里 1 ms 转一圈，不要用一大段 HAL_Delay 把轮询掐断。
+  */
+uint8_t 灰度_等确认(void)
+{
+    for (;;)
+    {
+        btn_event_t 事件 = 按键_取事件();
+
+        if (事件 == BTN_SEL) {
+            return 1U;
+        }
+        if (事件 == BTN_BACK) {
+            return 0U;
+        }
+
+        HAL_Delay(1U);
+    }
+}
+
+void 灰度_手动校准(void)
+{
+    uint16_t 记录[灰度_记录半字数];
+    uint16_t 黑值[巡线_路数];
+    uint16_t 白值[巡线_路数];
+    uint16_t 阈值[巡线_路数];
+    uint16_t 强阈值[巡线_路数];
+    uint16_t 有效路数 = 0U;
+    uint16_t i;
+
+    校准进行中 = 1U;
+    灰度_读记录(记录);
+
+    /* 进屋先清上电次数并写回：万一在校准中途断电，Flash 里的次数不会卡在 3，
+       否则之后每次上电都会又跳进校准。这一步和自动扫线一致。 */
+    记录[记录位_上电次数] = 0U;
+    记录[记录位_校验]     = 灰度_算校验(记录);
+    (void)灰度_写记录(记录);
+
+    灰度_闪灯(2U, 80U, 80U);           /* 进场信号：连闪 2 次 */
+    LED_ON();
+
+    printf("\r\n===== gray manual 2-point calibration =====\r\n");
+    printf("put the car on the BLACK line, press SEL; then on WHITE, press SEL\r\n");
+
+    /* ---- 第 1 步：黑线 ---- */
+    灰度_提示屏(文本_手动校准1, 文本_车横放线穿五路, 文本_确认等于采样);
+
+    if (灰度_等确认() == 0U) {
+        printf("manual calibration cancelled (black step)\r\n");
+        OLED_清屏();
+        OLED_显示中文串(0, 0, 文本_已取消);
+        OLED_刷新();
+        LED_OFF();
+        HAL_Delay(800U);
+        校准进行中 = 0U;
+        return;
+    }
+
+    灰度_采平均(黑值);
+
+    printf("black: %u %u %u %u %u\r\n",
+           (unsigned)黑值[0], (unsigned)黑值[1], (unsigned)黑值[2],
+           (unsigned)黑值[3], (unsigned)黑值[4]);
+
+    /* ---- 第 2 步：白底 ---- */
+    灰度_提示屏(文本_手动校准2, 文本_整机放到白底上, 文本_确认等于采样);
+
+    if (灰度_等确认() == 0U) {
+        printf("manual calibration cancelled (white step)\r\n");
+        OLED_清屏();
+        OLED_显示中文串(0, 0, 文本_已取消);
+        OLED_刷新();
+        LED_OFF();
+        HAL_Delay(800U);
+        校准进行中 = 0U;
+        return;
+    }
+
+    灰度_采平均(白值);
+
+    printf("white: %u %u %u %u %u\r\n",
+           (unsigned)白值[0], (unsigned)白值[1], (unsigned)白值[2],
+           (unsigned)白值[3], (unsigned)白值[4]);
+
+    /* ---- 算每路阈值：跨度不够的那一路保持原值 ---- */
+    for (i = 0U; i < 巡线_路数; i++)
+    {
+        int32_t 跨度 = (int32_t)黑值[i] - (int32_t)白值[i];
+
+        printf("  ch%u: white=%u black=%u span=%ld %s\r\n",
+               (unsigned)i, (unsigned)白值[i], (unsigned)黑值[i], (long)跨度,
+               (跨度 >= (int32_t)灰度_最小有效跨度) ? "" : "<- too small, kept");
+
+        if (跨度 >= (int32_t)灰度_最小有效跨度)
+        {
+            有效路数++;
+            阈值[i]   = (uint16_t)(((uint32_t)白值[i] + (uint32_t)黑值[i]) / 2U);
+            强阈值[i] = (uint16_t)((uint32_t)白值[i] + (uint32_t)跨度 * 3U / 4U);
+        }
+        else
+        {
+            阈值[i]   = 灰度_各路阈值[i];
+            强阈值[i] = 灰度_各路强阈值[i];
+        }
+    }
+
+    LED_OFF();
+
+    /* ---- 有效路数不够：整次作废，一个字节都不写 ---- */
+    if (有效路数 < 灰度_最少有效路数)
+    {
+        char 行[20];
+
+        printf("!!! only %u valid channel(s): calibration FAILED, Flash untouched\r\n",
+               (unsigned)有效路数);
+
+        OLED_清屏();
+        OLED_显示中文串(0, 0, 文本_校准失败);
+        (void)snprintf(行, sizeof(行), "ok %u/%u", (unsigned)有效路数, (unsigned)巡线_路数);
+        OLED_显示ASCII串(0, 16, 行);
+        OLED_显示中文串(0, 32, 文本_没压准);
+        OLED_刷新();
+
+        灰度_闪灯(30U, 80U, 80U);       /* 失败信号：急促连闪 30 次 */
+        HAL_Delay(1200U);
+        校准进行中 = 0U;
+        return;
+    }
+
+    /* ---- 落盘 ---- */
+    for (i = 0U; i < 巡线_路数; i++)
+    {
+        灰度_各路阈值[i]   = 阈值[i];
+        灰度_各路强阈值[i] = 强阈值[i];
+
+        记录[记录位_阈值首 + i]   = 阈值[i];
+        记录[记录位_强阈值首 + i] = 强阈值[i];
+    }
+
+    记录[记录位_标志]     = 记录标志_已校准;
+    记录[记录位_上电次数] = 0U;
+    记录[记录位_校验]     = 灰度_算校验(记录);
+
+    if (灰度_写记录(记录) != 0U)
+    {
+        已校准 = 1U;
+        printf("saved to Flash; every boot from now on reuses it\r\n");
+    }
+    else
+    {
+        printf("!!! Flash write failed: this calibration is valid for this run only\r\n");
+    }
+
+    /* ---- 结果屏：每路一行，中阈值/强阈值 ---- */
+    {
+        char 行[20];
+
+        OLED_清屏();
+        OLED_显示中文串(0, 0, 文本_校准完成);
+
+        for (i = 0U; i < 巡线_路数; i++)
+        {
+            (void)snprintf(行, sizeof(行), "%u:%u/%u",
+                           (unsigned)i, (unsigned)阈值[i], (unsigned)强阈值[i]);
+            OLED_显示ASCII串(0, (int16_t)(16 + i * 8), 行);
+        }
+        OLED_刷新();
+    }
+
+    LED_ON();
+    HAL_Delay(600U);
+    LED_OFF();
+    HAL_Delay(1600U);                    /* 让结果屏停留一会儿 */
+
+    printf("============================================\r\n\r\n");
+    校准进行中 = 0U;
+}
+
 /* ============================== 对外接口 =================================== */
+
+/* ---------------------------- 车库时间 ------------------------------------- */
+
+uint8_t 灰度_取车库时间(uint16_t *时间40毫秒, uint16_t *时间25毫秒)
+{
+    uint16_t 记录[灰度_记录半字数];
+
+    灰度_读记录(记录);
+
+    if ((记录[记录位_魔数] != 灰度_魔数)
+        || (记录[记录位_校验] != 灰度_算校验(记录)))
+    {
+        return 0U;                      /* 整条记录都不对，谈不上有标定值 */
+    }
+
+    if ((记录[记录位_车库40毫秒] == 0U) || (记录[记录位_车库25毫秒] == 0U)) {
+        return 0U;                      /* 记录有效，但还没做过车库标定 */
+    }
+
+    if (时间40毫秒 != NULL) { *时间40毫秒 = 记录[记录位_车库40毫秒]; }
+    if (时间25毫秒 != NULL) { *时间25毫秒 = 记录[记录位_车库25毫秒]; }
+
+    return 1U;
+}
+
+uint8_t 灰度_存车库时间(uint16_t 时间40毫秒, uint16_t 时间25毫秒)
+{
+    uint16_t 记录[灰度_记录半字数];
+
+    灰度_读记录(记录);
+
+    /* 整条记录坏掉（比如刚烧录、还没校准过）时，先按默认值铺一条，
+       否则这次标定就白跑了 —— 阈值那部分仍是默认值，用户照样可以再校准 */
+    if ((记录[记录位_魔数] != 灰度_魔数)
+        || (记录[记录位_校验] != 灰度_算校验(记录)))
+    {
+        printf("no valid record yet: laying down defaults before saving garage time\r\n");
+        灰度_铺默认记录(记录);
+    }
+
+    记录[记录位_车库40毫秒] = 时间40毫秒;
+    记录[记录位_车库25毫秒] = 时间25毫秒;
+    记录[记录位_校验]       = 灰度_算校验(记录);
+
+    if (灰度_写记录(记录) != 0U)
+    {
+        printf("garage time saved: 40cm=%u ms, 25cm=%u ms\r\n",
+               (unsigned)时间40毫秒, (unsigned)时间25毫秒);
+        return 1U;
+    }
+
+    printf("!!! Flash write failed: garage time is valid for this run only\r\n");
+    return 0U;
+}
 
 void 灰度_上电检查(void)
 {
@@ -626,7 +935,10 @@ void 灰度_恢复默认(void)
     记录[记录位_左电机速度] = (uint16_t)灰度_默认左电机速度;
     记录[记录位_右电机速度] = (uint16_t)灰度_默认右电机速度;
     记录[记录位_最低PWM]    = 灰度_默认最低PWM;
-    记录[记录位_保留]       = 0U;
+    /* 车库时间也是标定出来的东西，"恢复默认"就一并清掉：
+       清掉之后 detective() 会自动退回经验阈值，不会不认路 */
+    记录[记录位_车库40毫秒] = 0U;
+    记录[记录位_车库25毫秒] = 0U;
     记录[记录位_校验]       = 灰度_算校验(记录);
     (void)灰度_写记录(记录);
 
