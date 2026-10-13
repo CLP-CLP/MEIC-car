@@ -12,6 +12,7 @@
 #include "main.h"
 #include "stm32f1xx_it.h"
 #include "gray_calib.h"
+#include "ir_sensor.h"
 #include "usbd_conf.h"
 #include "vcp.h"
 
@@ -81,6 +82,19 @@ void SysTick_Handler(void)
     虚拟串口_轮询();
 
     灰度_窗口检查();        /* 上电满 2 秒就把"连续上电次数"清零（正常使用不误触发校准） */
+}
+
+/**
+  * @brief  DMA1 通道 1 中断：ADC1 的扫描结果搬完一轮
+  *
+  *         ADC1 在 F103 上固定用 DMA1_Channel1。巡线传感器是模拟量、挂不了
+  *         EXTI，所以"五路数据一好就通知 CPU"这件事就由这个中断来做：
+  *         每 105 µs 左右进一次，把扫描缓冲整理成"最新帧"，主循环只读内存，
+  *         于是巡线回环里再没有等 ADC 的时间（见 ir_sensor.c）。
+  */
+void DMA1_Channel1_IRQHandler(void)
+{
+    巡线_DMA完成中断();
 }
 
 /**

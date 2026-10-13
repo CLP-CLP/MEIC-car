@@ -24,6 +24,7 @@ void PendSV_Handler(void);
 void SysTick_Handler(void);
 
 /* 外设中断 ------------------------------------------------------------------*/
+void DMA1_Channel1_IRQHandler(void);
 void USB_LP_CAN1_RX0_IRQHandler(void);
 void USB_HP_CAN1_TX_IRQHandler(void);
 

@@ -51,6 +51,11 @@ void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc)
         __HAL_RCC_ADC1_CLK_ENABLE();
         __HAL_RCC_GPIOA_CLK_ENABLE();
 
+        /* ADC1 的扫描结果由 DMA1_Channel1 循环搬进内存（见 ir_sensor.c）：
+           F103 上 ADC1 只能走 DMA1 通道 1，这里把它的时钟一起打开。
+           巡线_用DMA = 0（轮询方式）时这句是多余的，开着也无害。 */
+        __HAL_RCC_DMA1_CLK_ENABLE();
+
         /* PA0 ~ PA4 配置为模拟输入（浮空，无上下拉），
            模拟模式下施密特触发器关闭，不会给传感器带来额外负载 */
         GPIO_InitStruct.Pin  = 巡线_全部引脚;

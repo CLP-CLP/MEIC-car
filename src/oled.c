@@ -224,6 +224,14 @@ void OLED_清屏(void)
     memset(OLED_显存, 0x00, sizeof(OLED_显存));
 }
 
+/* ============================== 分片刷新状态 =============================== */
+
+/** 分片刷新：已经送出去的字节数（送完清 0） */
+static uint16_t OLED_刷新偏移 = 0U;
+
+/** 1 = 正在分片送一帧，0 = 没在送 */
+static uint8_t  OLED_分片中   = 0U;
+
 void OLED_刷新(void)
 {
     static const uint8_t 列地址[] = { 0x21, 0x00, 0x7F };
@@ -247,6 +255,61 @@ void OLED_刷新(void)
         }
         已发 = (uint16_t)(已发 + 本块);
     }
+
+    /* 整帧送完：分片状态一并复位，免得半截状态和这里打架 */
+    OLED_刷新偏移 = 0U;
+    OLED_分片中   = 0U;
+}
+
+void OLED_开始分片刷新(void)
+{
+    static const uint8_t 列地址[] = { 0x21, 0x00, 0x7F };
+    static const uint8_t 页地址[] = { 0x22, 0x00, 0x07 };
+
+    /* 窗口设成整屏。之后 SSD1306 的地址指针会自己往下走，
+       所以后面每次续传都不用再发地址，接着发数据即可。 */
+    oled_命令序列(列地址, (uint16_t)sizeof(列地址));
+    oled_命令序列(页地址, (uint16_t)sizeof(页地址));
+
+    OLED_刷新偏移 = 0U;
+    OLED_分片中   = 1U;
+}
+
+uint8_t OLED_刷新分片(uint16_t 最多字节)
+{
+    uint16_t 剩余;
+
+    if (OLED_分片中 == 0U) {
+        return 1U;                  /* 没在送帧，当作"已经送完" */
+    }
+
+    剩余 = (uint16_t)(sizeof(OLED_显存) - (uint32_t)OLED_刷新偏移);
+    if (剩余 == 0U) {
+        OLED_分片中 = 0U;
+        return 1U;
+    }
+
+    if (最多字节 == 0U) {
+        最多字节 = 1U;
+    }
+    if (最多字节 > 剩余) {
+        最多字节 = 剩余;
+    }
+
+    /* 某一片发失败就重发一次（和整帧刷新一样的容错） */
+    if (i2c_发送(0x40U, &OLED_显存[OLED_刷新偏移], 最多字节) == 0U) {
+        (void)i2c_发送(0x40U, &OLED_显存[OLED_刷新偏移], 最多字节);
+    }
+
+    OLED_刷新偏移 = (uint16_t)(OLED_刷新偏移 + 最多字节);
+
+    if (OLED_刷新偏移 >= (uint16_t)sizeof(OLED_显存)) {
+        OLED_刷新偏移 = 0U;
+        OLED_分片中   = 0U;
+        return 1U;
+    }
+
+    return 0U;
 }
 
 void OLED_清屏并刷新(void)
@@ -776,6 +839,16 @@ void 显示_清屏(void)
 void 显示_刷新(void)
 {
     OLED_刷新();
+}
+
+void 显示_开始刷新(void)
+{
+    OLED_开始分片刷新();
+}
+
+uint8_t 显示_刷新分片(uint16_t 最多字节)
+{
+    return OLED_刷新分片(最多字节);
 }
 
 void 显示_画字符(uint8_t 列, uint8_t 行, char 字符)
