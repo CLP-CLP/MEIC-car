@@ -5,8 +5,8 @@
  *
  *  接线
  *      PB12 = 上键  一脚接 PB12，另一脚接 GND，内部上拉，按下 = 低电平
- *      PB13 = 下键  一脚接 PB13，另一脚接 GND，内部上拉，按下 = 低电平
- *      PB14 = 确认键 一脚接 PB14，另一脚接 GND，内部上拉，按下 = 低电平
+ *      PB13 = 确认键 一脚接 PB13，另一脚接 GND，内部上拉，按下 = 低电平
+ *      PB14 = 下键  一脚接 PB14，另一脚接 GND，内部上拉，按下 = 低电平
  *
  *  操作
  *      上键短按       ->  按键_上        光标上移
@@ -30,8 +30,8 @@ extern "C" {
 
 #define BTN_PORT                GPIOB
 #define BTN_UP_PIN              GPIO_PIN_12      /* 上 */
-#define BTN_DOWN_PIN            GPIO_PIN_13      /* 下 */
-#define BTN_SEL_PIN             GPIO_PIN_14      /* 确认（短按进入 / 长按返回）*/
+#define BTN_DOWN_PIN            GPIO_PIN_14      /* 下 */
+#define BTN_SEL_PIN             GPIO_PIN_13      /* 确认（短按进入 / 长按返回）*/
 
 /** 确认键长按多久算"返回"（毫秒） */
 #define BTN_LONG_MS             2000U
