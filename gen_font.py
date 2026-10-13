@@ -50,16 +50,16 @@ OUTPUT_FILE = "src/cn_font_data.h"   # 输出
 FONT_PATH = None                     # None = 自动查找；也可写死一个 .ttf/.ttc
 
 CELL = 16                            # 单字格子尺寸（像素）
-INK_MAX = 13                         # 墨迹最大尺寸：上下左右各留 1.5 像素余量
+INK_MAX = 14                         # 墨迹最大尺寸：上下左右各留 1 像素余量
 
 # 自动挑选字号时的候选（从大到小）
 FONT_SIZE_CANDIDATES = [16, 15, 14, 13, 12]
 
-# 备选字体（Windows 优先）
+# 备选字体（Windows 优先；实测小字号下雅黑/黑体笔画更实，反白高亮时最清楚）
 _WIN_FONTS = [
-    "C:/Windows/Fonts/simsun.ttc",       # 宋体：点阵风格最标准
-    "C:/Windows/Fonts/simhei.ttf",       # 黑体
     "C:/Windows/Fonts/msyh.ttc",         # 微软雅黑
+    "C:/Windows/Fonts/simhei.ttf",       # 黑体
+    "C:/Windows/Fonts/simsun.ttc",       # 宋体
     "C:/Windows/Fonts/Deng.ttf",         # 等线
     "C:/Windows/Fonts/simsunb.ttf",
 ]
@@ -94,7 +94,11 @@ def find_chinese_chars(project_root, dirs):
         full = os.path.join(project_root, d)
         if not os.path.isdir(full):
             continue
-        for root, _, files in os.walk(full):
+        for root, subdirs, files in os.walk(full):
+            # 跳过嵌套的独立工程（比如 meic/ 里也有一份 main.c）：
+            # 只扫本工程自己的代码，否则字库会被别处的文案撑大。
+            subdirs[:] = [s for s in subdirs
+                          if not os.path.exists(os.path.join(root, s, "platformio.ini"))]
             for fn in files:
                 if not fn.endswith((".c", ".h")):
                     continue
@@ -119,25 +123,36 @@ def find_chinese_chars(project_root, dirs):
 # ============================ 字形渲染 =======================================
 
 def render_ink(ch, font):
-    """把字符渲染出来，返回 (灰度图, 墨迹包围盒)。灰度图带一点抗锯齿。"""
-    pad = 6
+    """
+    把字符渲染到一张大画布上，返回 (灰度图, 包围盒, 基线相关偏移)。
+
+    只裁左右和上方空白是危险的：**不能按每个字各自的墨迹高度去居中**，
+    否则同一行里不同字会上下浮动（比如“巡线”和“倒库”的墨迹高度不一样）。
+    所以这里额外返回基线信息，由 glyph_from_ink() 统一对齐基线。
+    """
+    pad = 12
     canvas = Image.new("L", (CELL * 2 + pad * 2, CELL * 2 + pad * 2), 0)
     ImageDraw.Draw(canvas).text((pad, pad), ch, font=font, fill=255)
     bbox = canvas.getbbox()
     if bbox is None:
-        return None, None
-    return canvas.crop(bbox), bbox
+        return None, None, None
+    # 该字符的排版基线（相对画布顶部）
+    try:
+        ascent, descent = font.getmetrics()
+    except Exception:
+        ascent, descent = bbox[3] - bbox[1], 0
+    return canvas.crop(bbox), bbox, (ascent, descent, pad)
 
 
-def glyph_from_ink(ink, allow_scale=False):
+def glyph_from_ink(ink, meta=None, allow_scale=False):
     """
     把墨迹放进 INK_MAX x INK_MAX 的“安全盒”，再居中放进 16x16，转成 32 字节列序点阵。
 
-    allow_scale=False（默认）时**不做任何缩放**：装不下就直接报“装不下”，
-    交给 choose_font() 去换更小的字号。缩放会把笔画糊在一起（比如 13px 的
-    “菜单”两个字会被缩成一团），所以宁可换字号也不缩。
+    allow_scale=False（默认）时**不做任何缩放**：装不下就返回失败，
+    交给 choose_font() 换更小的字号。缩放会糊笔画，宁可换字号也不缩。
 
-    返回 (bytes32, (w, h))；墨迹为空返回 (None, None)。
+    meta = (ascent, descent, pad)：用于把不同字的**基线对齐**，
+    避免同一行里的汉字上下浮动。
     """
     iw, ih = ink.size
     if iw <= 0 or ih <= 0:
@@ -152,9 +167,20 @@ def glyph_from_ink(ink, allow_scale=False):
         ink = ink.resize((nw, nh), Image.LANCZOS)
         iw, ih = nw, nh
 
-    # 先居中放进安全盒，再把安全盒居中放进格子 —— 上下左右余量对称
     box = Image.new("L", (INK_MAX, INK_MAX), 0)
-    box.paste(ink, ((INK_MAX - iw) // 2, (INK_MAX - ih) // 2))
+    if meta is not None:
+        # 所有字共用一条基线：把基线放在安全盒内固定高度，字就不会上下浮动
+        ascent = meta[0]
+        target_baseline = INK_MAX - 2          # 基线离盒底 2 像素
+        y = target_baseline - ascent
+        if y + ih > INK_MAX:                   # 太高就往下压
+            y = INK_MAX - ih
+        if y < 0:                              # 太矮就顶到 0
+            y = 0
+    else:
+        y = (INK_MAX - ih) // 2
+
+    box.paste(ink, ((INK_MAX - iw) // 2, y))
 
     cell = Image.new("L", (CELL, CELL), 0)
     off = (CELL - INK_MAX) // 2
@@ -217,11 +243,11 @@ def choose_font(font_paths, chars):
             overflow = False
 
             for ch in chars:
-                ink, _ = render_ink(ch, font)
+                ink, _bb, meta = render_ink(ch, font)
                 if ink is None:
                     glyphs[ch] = bytes(32)
                     continue
-                data, (w, h) = glyph_from_ink(ink, allow_scale=False)
+                data, (w, h) = glyph_from_ink(ink, meta, allow_scale=False)
                 worst = max(worst, w, h)
                 if data is None:
                     overflow = True
@@ -247,11 +273,11 @@ def choose_font(font_paths, chars):
             worst = 0
             ok = True
             for ch in chars:
-                ink, _ = render_ink(ch, font)
+                ink, _bb, meta = render_ink(ch, font)
                 if ink is None:
                     glyphs[ch] = bytes(32)
                     continue
-                data, (w, h) = glyph_from_ink(ink, allow_scale=True)
+                data, (w, h) = glyph_from_ink(ink, meta, allow_scale=True)
                 if data is None:
                     ok = False
                     break

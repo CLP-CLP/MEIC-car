@@ -1,23 +1,19 @@
 /**
  ******************************************************************************
  * @file    oled.c
- * @brief   SSD1306 0.96" OLED（I2C1，PB6=SCL / PB7=SDA）驱动
+ * @brief   SSD1306 128x64 I2C OLED 驱动（软件 I2C，PB6=SCL / PB7=SDA）
  *
- *  这一版重写的三件事
- *  ---------------------------------------------------------------
- *  1. **汉字绘制严格对齐 2 列 x 2 行**，只写自己那 32 个字节，不碰相邻行。
- *     配合 gen_font.py 把字模墨迹限制在 15x15，行与行之间不可能再出现
- *     越界的半截笔画（原来的“行间乱码”）。
+ *  结构
+ *      1. 软件 I2C 底层（起始 / 停止 / 写字节 / 读应答）
+ *      2. SSD1306 命令与整屏刷新
+ *      3. 显存与基本图元：点 / 线 / 矩形 / 填充矩形 / 圆 / 位图
+ *      4. 文本：16x16 汉字 + 8x8 ASCII，可指定颜色（用于反白高亮）
  *
- *  2. **I2C 全程检查返回值**。原来写的是 (void)HAL_I2C_Mem_Write(...)，
- *     一次失败就静默丢掉一整块像素数据，屏上留下上一帧的残影。
- *     现在失败会重试；整屏数据里只要有一块重试仍失败，就把整帧重刷一遍，
- *     仍失败就复位 SSD1306 再刷 —— 宁可慢一点，也不留鬼影。
- *
- *  3. **I2C 用 100 kHz**。本工程 PCLK1=36 MHz，跑 400 kHz 时 SCL 高电平
- *     只有约 280 ns，低于 I2C 快速模式要求的 600 ns，会偶发传输错误。
- *
- *  ⚠ 本文件里的 HAL_I2C_MspInit() 是 HAL 按名字回调的弱符号，名字不能改。
+ *  为什么不用 HAL 硬件 I2C
+ *      F103 的 I2C1 挂在 PCLK1 上（本工程 36 MHz）。跑 400 kHz 快速模式时
+ *      SCL 高电平只有约 280 ns，而 I2C 规范要求 tHIGH >= 600 ns —— 时序不满足，
+ *      传输会偶发失败丢掉一整块像素数据，屏上就会出现残留的半截笔画。
+ *      软件 I2C 时序完全由代码控制，从根上避开这个问题；从机没接好也不会卡死。
  ******************************************************************************
  */
 
@@ -27,26 +23,376 @@
 
 #include <string.h>
 
-/* ---- 编译前由 gen_font.py 生成的中文字库 ---- */
+/* ---- 编译前由 gen_font.py 生成的按需中文字库 ---- */
 #include "cn_font_data.h"
 
-/* ============================== 私有变量 =================================== */
+/* ============================== 显存 ======================================= */
 
-static I2C_HandleTypeDef 显示_I2C;
+/** 1024 字节显存，按 [页(y/8) * 128 + x] 寻址，位序与 SSD1306 一致 */
+static uint8_t OLED_显存[OLED_宽 * OLED_高 / 8U];
 
-/** 帧缓冲：1024 字节，按 [页(行) * 128 + 列] 寻址，与 SSD1306 位序一致 */
-static uint8_t 显示_帧缓冲[显示_宽度 * 显示_高度 / 8U];
+/* ============================== 软件 I2C =================================== */
 
-/** 一次 I2C 传输的重试次数 */
-#define 显示_重试次数        3U
+/** 短延时：一个空循环约 3 个周期，够拉出 I2C 的建立/保持时间 */
+static void i2c_延时(void)
+{
+    volatile uint8_t i;
+    for (i = 0U; i < OLED_半周期延时; i++) {
+        __NOP();
+    }
+}
 
-/** 防止“复位->刷新->再复位”无限递归 */
-static uint8_t 显示_恢复深度 = 0U;
+static void i2c_SCL(uint8_t 高)
+{
+    HAL_GPIO_WritePin(OLED_SCL端口, OLED_SCL引脚,
+                      (高 != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void i2c_SDA(uint8_t 高)
+{
+    HAL_GPIO_WritePin(OLED_SDA端口, OLED_SDA引脚,
+                      (高 != 0U) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static uint8_t i2c_读SDA(void)
+{
+    return (HAL_GPIO_ReadPin(OLED_SDA端口, OLED_SDA引脚) == GPIO_PIN_SET) ? 1U : 0U;
+}
+
+/** I2C 起始条件：SCL 高时 SDA 由高变低 */
+static void i2c_起始(void)
+{
+    i2c_SDA(1); i2c_SCL(1); i2c_延时();
+    i2c_SDA(0); i2c_延时();
+    i2c_SCL(0); i2c_延时();
+}
+
+/** I2C 停止条件：SCL 高时 SDA 由低变高 */
+static void i2c_停止(void)
+{
+    i2c_SDA(0); i2c_延时();
+    i2c_SCL(1); i2c_延时();
+    i2c_SDA(1); i2c_延时();
+}
+
+/**
+  * @brief  发一个字节，读从机应答
+  * @retval 1 = 有应答（ACK），0 = 无应答（NACK）
+  */
+static uint8_t i2c_写字节(uint8_t 数据)
+{
+    uint8_t i;
+    uint8_t 应答;
+
+    for (i = 0U; i < 8U; i++)
+    {
+        i2c_SDA((数据 & 0x80U) ? 1U : 0U);
+        数据 = (uint8_t)(数据 << 1);
+        i2c_延时();
+        i2c_SCL(1); i2c_延时();
+        i2c_SCL(0); i2c_延时();
+    }
+
+    /* 第 9 个时钟：释放 SDA，看从机是否拉低 */
+    i2c_SDA(1); i2c_延时();
+    i2c_SCL(1); i2c_延时();
+    应答 = (i2c_读SDA() == 0U) ? 1U : 0U;
+    i2c_SCL(0); i2c_延时();
+
+    return 应答;
+}
+
+/**
+  * @brief  发一帧：从机地址 + 控制字节 + 数据
+  * @param  控制 0x00 = 命令，0x40 = 显存数据
+  * @retval 1 = 全部有应答，0 = 中途掉线
+  */
+static uint8_t i2c_发送(uint8_t 控制, const uint8_t *数据, uint16_t 长度)
+{
+    uint16_t i;
+    uint8_t  好 = 1U;
+
+    i2c_起始();
+    if (i2c_写字节((uint8_t)OLED_I2C地址) == 0U) {
+        好 = 0U;
+    } else if (i2c_写字节(控制) == 0U) {
+        好 = 0U;
+    } else {
+        for (i = 0U; i < 长度; i++)
+        {
+            if (i2c_写字节(数据[i]) == 0U) {
+                好 = 0U;
+                break;
+            }
+        }
+    }
+    i2c_停止();
+
+    return 好;
+}
+
+/* ============================== SSD1306 命令 =============================== */
+
+static void oled_命令(uint8_t 命令)
+{
+    (void)i2c_发送(0x00U, &命令, 1U);
+}
+
+static void oled_命令序列(const uint8_t *命令, uint16_t 个数)
+{
+    (void)i2c_发送(0x00U, 命令, 个数);
+}
+
+/* ============================== 初始化 ===================================== */
+
+/** 配置 PB6/PB7 为 I2C 用的输出 */
+static void oled_引脚初始化(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin   = OLED_SCL引脚 | OLED_SDA引脚;
+#if OLED_推挽输出
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+#else
+    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_OD;      /* 开漏 + 模块上拉 */
+    GPIO_InitStruct.Pull  = GPIO_PULLUP;
+#endif
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(OLED_SCL端口, &GPIO_InitStruct);
+
+    i2c_SCL(1);
+    i2c_SDA(1);
+}
+
+/** SSD1306 上电初始化序列（含软件复位） */
+static void oled_发初始化序列(void)
+{
+    static const uint8_t 序列[] = {
+        0xAE,                   /* 关显示，先别让残影露出来 */
+        0x20, 0x00,             /* 水平寻址模式 */
+        0xB0,                   /* 页地址 0 */
+        0xC8,                   /* COM 扫描反向（上下颠倒就改 0xC0） */
+        0x00,                   /* 低列地址 0 */
+        0x10,                   /* 高列地址 0 */
+        0x40,                   /* 起始行 0 */
+        0x81, 0xCF,             /* 对比度 */
+        0xA1,                   /* 段重映射（左右镜像就改 0xA0） */
+        0xA6,                   /* 正常显示，不反色 */
+        0xA8, 0x3F,             /* 多路复用 1/64 */
+        0xA4,                   /* 显示跟随显存 */
+        0xD3, 0x00,             /* 显示偏移 0 */
+        0xD5, 0x80,             /* 时钟分频 */
+        0xD9, 0xF1,             /* 预充电周期 */
+        0xDA, 0x12,             /* COM 引脚配置 */
+        0xDB, 0x40,             /* VCOMH */
+        0x8D, 0x14,             /* 使能电荷泵 */
+        0xAF                    /* 开显示 */
+    };
+    static const uint8_t 软件复位[] = { 0xE2 };
+
+    oled_命令序列(软件复位, 1U);
+    HAL_Delay(10U);
+    oled_命令序列(序列, (uint16_t)sizeof(序列));
+}
+
+void OLED_初始化(void)
+{
+    oled_引脚初始化();
+    oled_发初始化序列();
+    memset(OLED_显存, 0x00, sizeof(OLED_显存));
+    OLED_刷新();
+}
+
+uint8_t OLED_是否在线(void)
+{
+    uint8_t 应答;
+
+    i2c_起始();
+    应答 = i2c_写字节((uint8_t)OLED_I2C地址);
+    i2c_停止();
+
+    return 应答;
+}
+
+/* ============================== 显示控制 =================================== */
+
+void OLED_清屏(void)
+{
+    memset(OLED_显存, 0x00, sizeof(OLED_显存));
+}
+
+void OLED_刷新(void)
+{
+    static const uint8_t 列地址[] = { 0x21, 0x00, 0x7F };
+    static const uint8_t 页地址[] = { 0x22, 0x00, 0x07 };
+    uint16_t 已发 = 0U;
+
+    /* 设定窗口：列 0..127，页 0..7，然后一次把 1024 字节显存送过去 */
+    oled_命令序列(列地址, (uint16_t)sizeof(列地址));
+    oled_命令序列(页地址, (uint16_t)sizeof(页地址));
+
+    /* 分块发送，单次传输不要太长；某块失败就重发一次 */
+    while (已发 < (uint16_t)sizeof(OLED_显存))
+    {
+        uint16_t 本块 = (uint16_t)(sizeof(OLED_显存) - 已发);
+        if (本块 > 128U) {
+            本块 = 128U;
+        }
+
+        if (i2c_发送(0x40U, &OLED_显存[已发], 本块) == 0U) {
+            (void)i2c_发送(0x40U, &OLED_显存[已发], 本块);
+        }
+        已发 = (uint16_t)(已发 + 本块);
+    }
+}
+
+void OLED_清屏并刷新(void)
+{
+    OLED_清屏();
+    OLED_刷新();
+}
+
+void OLED_开显示(uint8_t 开)
+{
+    oled_命令((开 != 0U) ? 0xAFU : 0xAEU);
+}
+
+void OLED_反色(uint8_t 反)
+{
+    oled_命令((反 != 0U) ? 0xA7U : 0xA6U);
+}
+
+void OLED_设置亮度(uint8_t 亮度)
+{
+    oled_命令(0x81U);
+    oled_命令(亮度);
+}
+
+/* ============================== 基本图元 =================================== */
+
+void OLED_画点(int16_t x, int16_t y, uint8_t 颜色)
+{
+    uint8_t 掩码;
+
+    if (x < 0 || y < 0 || x >= OLED_宽 || y >= OLED_高) {
+        return;
+    }
+
+    掩码 = (uint8_t)(1U << (y & 7));
+    if (颜色 != 0U) {
+        OLED_显存[((uint16_t)(y >> 3) * OLED_宽) + (uint16_t)x] |= 掩码;
+    } else {
+        OLED_显存[((uint16_t)(y >> 3) * OLED_宽) + (uint16_t)x] &= (uint8_t)(~掩码);
+    }
+}
+
+void OLED_画线(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t 颜色)
+{
+    int16_t dx = (int16_t)((x1 > x0) ? (x1 - x0) : (x0 - x1));
+    int16_t dy = (int16_t)((y1 > y0) ? (y1 - y0) : (y0 - y1));
+    int16_t sx = (x0 < x1) ? 1 : -1;
+    int16_t sy = (y0 < y1) ? 1 : -1;
+    int16_t 误差 = (int16_t)(dx - dy);
+
+    for (;;)
+    {
+        int16_t e2;
+
+        OLED_画点(x0, y0, 颜色);
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        e2 = (int16_t)(误差 << 1);
+        if (e2 > -dy) {
+            误差 = (int16_t)(误差 - dy);
+            x0 = (int16_t)(x0 + sx);
+        }
+        if (e2 < dx) {
+            误差 = (int16_t)(误差 + dx);
+            y0 = (int16_t)(y0 + sy);
+        }
+    }
+}
+
+void OLED_填充矩形(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t 颜色)
+{
+    int16_t x, y;
+
+    if (x0 > x1) { int16_t t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { int16_t t = y0; y0 = y1; y1 = t; }
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > (OLED_宽 - 1)) { x1 = OLED_宽 - 1; }
+    if (y1 > (OLED_高 - 1)) { y1 = OLED_高 - 1; }
+
+    for (y = y0; y <= y1; y++)
+    {
+        for (x = x0; x <= x1; x++) {
+            OLED_画点(x, y, 颜色);
+        }
+    }
+}
+
+void OLED_画矩形(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t 颜色)
+{
+    OLED_画线(x0, y0, x1, y0, 颜色);
+    OLED_画线(x0, y1, x1, y1, 颜色);
+    OLED_画线(x0, y0, x0, y1, 颜色);
+    OLED_画线(x1, y0, x1, y1, 颜色);
+}
+
+void OLED_画圆(int16_t 圆心x, int16_t 圆心y, int16_t 半径, uint8_t 颜色)
+{
+    int16_t x = 0;
+    int16_t y = 半径;
+    int16_t d = (int16_t)(3 - (半径 << 1));
+
+    while (x <= y)
+    {
+        OLED_画点((int16_t)(圆心x + x), (int16_t)(圆心y + y), 颜色);
+        OLED_画点((int16_t)(圆心x - x), (int16_t)(圆心y + y), 颜色);
+        OLED_画点((int16_t)(圆心x + x), (int16_t)(圆心y - y), 颜色);
+        OLED_画点((int16_t)(圆心x - x), (int16_t)(圆心y - y), 颜色);
+        OLED_画点((int16_t)(圆心x + y), (int16_t)(圆心y + x), 颜色);
+        OLED_画点((int16_t)(圆心x - y), (int16_t)(圆心y + x), 颜色);
+        OLED_画点((int16_t)(圆心x + y), (int16_t)(圆心y - x), 颜色);
+        OLED_画点((int16_t)(圆心x - y), (int16_t)(圆心y - x), 颜色);
+
+        if (d < 0) {
+            d = (int16_t)(d + (x << 2) + 6);
+        } else {
+            d = (int16_t)(d + ((x - y) << 2) + 10);
+            y--;
+        }
+        x++;
+    }
+}
+
+void OLED_画位图(int16_t x, int16_t y, uint8_t 宽, uint8_t 高, const uint8_t *位图)
+{
+    uint8_t 列, 行;
+
+    for (列 = 0U; 列 < 宽; 列++)
+    {
+        for (行 = 0U; 行 < 高; 行++)
+        {
+            uint8_t 页 = (uint8_t)(行 >> 3);
+            uint8_t 位 = (uint8_t)(行 & 7U);
+            uint8_t 字节 = 位图[(uint16_t)页 * 宽 + 列];
+
+            if ((字节 & (uint8_t)(1U << 位)) != 0U) {
+                OLED_画点((int16_t)(x + 列), (int16_t)(y + 行), OLED_亮);
+            }
+        }
+    }
+}
 
 /* ============================== 8x8 ASCII 字库 ============================= */
-/* Public Domain font8x8_basic，U+0000~U+007F。
-   每字符 8 字节 = 8 行，每字节一行 8 像素，bit0 在最左。
-   画的时候要转置成 SSD1306 的列序。 */
+/* Public Domain font8x8_basic，U+0000~U+007F。每字符 8 字节 = 8 行，
+   每字节一行 8 像素、bit0 在最左。绘制时转置成 SSD1306 的列序。 */
 
 static const uint8_t font8x8[128][8] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x00 */
@@ -81,7 +427,7 @@ static const uint8_t font8x8[128][8] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x1D */
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x1E */
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x1F */
-    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x20 space */
+    { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x20 空格 */
     { 0x18, 0x3C, 0x3C, 0x18, 0x18, 0x00, 0x18, 0x00},   /* 0x21 ! */
     { 0x36, 0x36, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x22 " */
     { 0x36, 0x36, 0x7F, 0x36, 0x7F, 0x36, 0x36, 0x00},   /* 0x23 # */
@@ -179,334 +525,10 @@ static const uint8_t font8x8[128][8] = {
     { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},   /* 0x7F */
 };
 
-/* ============================== SSD1306 命令 =============================== */
+/* ============================== 字库查找 =================================== */
 
-#define 命令_显示关        0xAE
-#define 命令_显示开        0xAF
-#define 命令_起始行        0x40
-#define 命令_段重映射      0xA1
-#define 命令_COM扫描反向   0xC8
-#define 命令_正常显示      0xA6
-#define 命令_反色显示      0xA7
-#define 命令_内存水平      0x20
-#define 命令_列地址        0x21
-#define 命令_页地址        0x22
-
-/* ============================== MSP 初始化 ================================= */
-
-/**
-  * @brief  I2C1 底层初始化，由 HAL_I2C_Init() 自动调用
-  *         PB6 = SCL，PB7 = SDA，复用开漏输出
-  * @note   函数名是 HAL 按名字回调的弱符号，不能改成中文
-  */
-void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
-{
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-    if (hi2c->Instance == I2C1)
-    {
-        __HAL_RCC_I2C1_CLK_ENABLE();
-        __HAL_RCC_GPIOB_CLK_ENABLE();
-
-        GPIO_InitStruct.Pin   = GPIO_PIN_6 | GPIO_PIN_7;
-        GPIO_InitStruct.Mode  = GPIO_MODE_AF_OD;
-        GPIO_InitStruct.Pull  = GPIO_PULLUP;
-        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-        HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-    }
-}
-
-/* ============================== I2C 底层 =================================== */
-
-/**
-  * @brief  发一条命令（控制字节 0x00），失败自动重试
-  * @retval 1 = 成功，0 = 重试用完仍失败
-  */
-static uint8_t 显示_写命令(uint8_t 命令)
-{
-    uint8_t i;
-
-    for (i = 0U; i < 显示_重试次数; i++)
-    {
-        if (HAL_I2C_Mem_Write(&显示_I2C, 显示_I2C地址, 0x00,
-                              I2C_MEMADD_SIZE_8BIT, &命令, 1U, 100U) == HAL_OK) {
-            return 1U;
-        }
-    }
-    return 0U;
-}
-
-/**
-  * @brief  发一段显示数据（控制字节 0x40），失败自动重试
-  * @retval 1 = 成功，0 = 重试用完仍失败
-  */
-static uint8_t 显示_写数据(const uint8_t *数据, uint16_t 长度)
-{
-    uint8_t i;
-
-    for (i = 0U; i < 显示_重试次数; i++)
-    {
-        if (HAL_I2C_Mem_Write(&显示_I2C, 显示_I2C地址, 0x40,
-                              I2C_MEMADD_SIZE_8BIT, (uint8_t *)数据,
-                              长度, 1000U) == HAL_OK) {
-            return 1U;
-        }
-    }
-    return 0U;
-}
-
-/* ============================== 初始化 ===================================== */
-
-/** 发一整段命令序列 */
-static void 显示_发命令序列(const uint8_t *命令, uint16_t 个数)
-{
-    uint16_t i;
-    for (i = 0U; i < 个数; i++) {
-        (void)显示_写命令(命令[i]);
-    }
-}
-
-/**
-  * @brief  SSD1306 上电初始化（不刷帧缓冲）
-  * @note   地址 0x00 时给一个复位脉冲，让控制器从确定状态开始
-  */
-static void 显示_ssd1306初始化(void)
-{
-    static const uint8_t 序列[] = {
-        命令_显示关,            /* 先关显示，避免上电残影 */
-        0xD5, 0x80,             /* 时钟分频 / 振荡频率 */
-        0xA8, 0x3F,             /* 多路复用比 1/64 */
-        0xD3, 0x00,             /* 显示偏移 0 */
-        命令_起始行,            /* 起始行 0 */
-        0x8D, 0x14,             /* 使能电荷泵 */
-        命令_内存水平, 0x00,    /* 水平寻址模式 */
-        命令_段重映射,          /* 左右镜像就换成 0xA0 */
-        命令_COM扫描反向,       /* 上下颠倒就换成 0xC0 */
-        0xDA, 0x12,             /* COM 引脚配置 */
-        0x81, 0xCF,             /* 对比度 */
-        0xD9, 0xF1,             /* 预充电周期 */
-        0xDB, 0x40,             /* VCOMH 检测 */
-        0xA4,                   /* 显示跟随 RAM */
-        命令_正常显示,          /* 不反色 */
-        命令_显示开
-    };
-
-    /* 用 0x00 写一次，某些模块把它当软件复位；失败也无所谓 */
-    (void)显示_写命令(0x00);
-    HAL_Delay(10U);
-
-    显示_发命令序列(序列, (uint16_t)sizeof(序列));
-}
-
-void 显示_初始化(void)
-{
-    显示_I2C.Instance             = I2C1;
-    /*
-     * ⚠ I2C 用 100 kHz，不要改回 400 kHz。
-     * F103 的 I2C1 挂在 PCLK1 上，本工程 SYSCLK=72 MHz -> PCLK1=36 MHz；
-     * 400 kHz 快速模式在 36 MHz PCLK1 下 SCL 高电平只有约 280 ns，
-     * 低于 I2C 规范要求的 600 ns，会偶发传输错误（丢数据 -> 屏上残影）。
-     * 100 kHz 下高电平约 2.8 us，余量充足。
-     * 刷满一帧 1 KB 约 90 ms，只在按键/定时刷新时发生，观感无影响。
-     */
-    显示_I2C.Init.ClockSpeed      = 100000U;
-    显示_I2C.Init.DutyCycle       = I2C_DUTYCYCLE_2;
-    显示_I2C.Init.OwnAddress1     = 0U;
-    显示_I2C.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
-    显示_I2C.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-    显示_I2C.Init.OwnAddress2     = 0U;
-    显示_I2C.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-    显示_I2C.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
-
-    if (HAL_I2C_Init(&显示_I2C) != HAL_OK) {
-        Error_Handler();
-    }
-
-    显示_ssd1306初始化();
-    显示_清屏();
-    显示_刷新();
-}
-
-/* ============================== 帧缓冲 ===================================== */
-
-void 显示_清屏(void)
-{
-    memset(显示_帧缓冲, 0x00, sizeof(显示_帧缓冲));
-}
-
-/** 整帧发送一次，返回“是否全部块都发成功” */
-static uint8_t 显示_发整帧(void)
-{
-    /* 设定窗口：列 0..127，页 0..7 */
-    uint8_t 寻址[] = {
-        命令_列地址, 0x00, 0x7F,
-        命令_页地址, 0x00, 0x07
-    };
-    uint8_t *指针 = 显示_帧缓冲;
-    uint16_t 剩余 = (uint16_t)sizeof(显示_帧缓冲);
-    uint8_t 全部成功 = 1U;
-    uint8_t i;
-    uint8_t 寻址成功 = 0U;
-
-    /* 寻址命令必须成功：丢了会让像素写进错误地址，画面整体错位 */
-    for (i = 0U; i < 显示_重试次数; i++)
-    {
-        uint8_t j;
-        寻址成功 = 1U;
-        for (j = 0U; j < sizeof(寻址); j++)
-        {
-            if (显示_写命令(寻址[j]) == 0U) {
-                寻址成功 = 0U;
-                break;
-            }
-        }
-        if (寻址成功 != 0U) {
-            break;
-        }
-    }
-    if (寻址成功 == 0U) {
-        return 0U;
-    }
-
-    /* 分块发送，单次传输不要太长 */
-    while (剩余 > 0U)
-    {
-        uint16_t 本次 = (剩余 > 128U) ? 128U : 剩余;
-        if (显示_写数据(指针, 本次) == 0U) {
-            全部成功 = 0U;          /* 记录失败，但继续发完剩下的块 */
-        }
-        指针 += 本次;
-        剩余 -= 本次;
-    }
-
-    return 全部成功;
-}
-
-void 显示_刷新(void)
-{
-    if (显示_发整帧() == 0U)
-    {
-        /* 有块没发成功：整帧再刷一遍（前面的块可能已写坏，重发保证一致） */
-        if (显示_发整帧() == 0U)
-        {
-            /* 还是失败：复位控制器，再刷一次 */
-            if (显示_恢复深度 == 0U)
-            {
-                显示_恢复深度 = 1U;
-                显示_ssd1306初始化();
-                显示_清屏();
-                (void)显示_发整帧();
-                显示_恢复深度 = 0U;
-            }
-        }
-    }
-}
-
-/* ============================== 画点 / 基本图元 ============================ */
-
-/** 点亮一个像素（坐标自动裁剪） */
-static void 显示_画点(uint8_t x, uint8_t y)
-{
-    if (x >= 显示_宽度 || y >= 显示_高度) {
-        return;
-    }
-    显示_帧缓冲[((uint16_t)(y >> 3) * 显示_宽度) + x] |= (uint8_t)(1U << (y & 7U));
-}
-
-void 显示_画空心框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
-{
-    uint8_t x, y;
-
-    if (x0 > 127U) x0 = 127U;
-    if (x1 > 127U) x1 = 127U;
-    if (y0 > 63U)  y0 = 63U;
-    if (y1 > 63U)  y1 = 63U;
-    if (x0 > x1 || y0 > y1) {
-        return;
-    }
-
-    for (x = x0; x <= x1; x++)
-    {
-        显示_画点(x, y0);
-        显示_画点(x, y1);
-    }
-    for (y = y0; y <= y1; y++)
-    {
-        显示_画点(x0, y);
-        显示_画点(x1, y);
-    }
-}
-
-void 显示_反白框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
-{
-    uint8_t x, y;
-
-    if (x0 > 127U) x0 = 127U;
-    if (x1 > 127U) x1 = 127U;
-    if (y0 > 63U)  y0 = 63U;
-    if (y1 > 63U)  y1 = 63U;
-    if (x0 > x1 || y0 > y1) {
-        return;
-    }
-
-    for (y = y0; y <= y1; y++)
-    {
-        for (x = x0; x <= x1; x++)
-        {
-            显示_帧缓冲[((uint16_t)(y >> 3) * 显示_宽度) + x] ^= (uint8_t)(1U << (y & 7U));
-        }
-    }
-}
-
-/* ============================== ASCII 绘制 ================================= */
-
-void 显示_画字符(uint8_t 列, uint8_t 行, char 字符)
-{
-    const uint8_t *字形;
-    uint8_t *缓冲指针;
-    uint8_t x, y;
-
-    if (列 >= 显示_列数 || 行 >= 显示_行数) {
-        return;
-    }
-
-    字形     = font8x8[(uint8_t)字符 & 0x7FU];
-    缓冲指针 = &显示_帧缓冲[(uint16_t)行 * 显示_宽度 + (uint16_t)列 * 8U];
-
-    /* font8x8 是“行序”（每字节一行、bit0 最左），SSD1306 是“列序”，要转置 */
-    for (x = 0U; x < 8U; x++)
-    {
-        uint8_t 竖列 = 0U;
-        for (y = 0U; y < 8U; y++)
-        {
-            if (字形[y] & (uint8_t)(1U << x)) {
-                竖列 |= (uint8_t)(1U << y);
-            }
-        }
-        缓冲指针[x] = 竖列;
-    }
-}
-
-void 显示_画字符串(uint8_t 列, uint8_t 行, const char *串)
-{
-    while (*串 != '\0')
-    {
-        显示_画字符(列, 行, *串);
-        列++;
-        if (列 >= 显示_列数) {
-            break;
-        }
-        串++;
-    }
-}
-
-/* ============================== 中文查找 =================================== */
-
-/**
-  * @brief  二分查找 Unicode 码点对应的字形下标
-  * @retval >= 0 找到；-1 没有这个字
-  */
-static int16_t 显示_查字形(uint16_t 码点)
+/** 二分查找码点对应的字形下标，找不到返回 -1 */
+static int16_t 字库_查字形(uint16_t 码点)
 {
     int16_t lo = 0;
     int16_t hi = (int16_t)(CN_FONT_COUNT - 1U);
@@ -527,11 +549,8 @@ static int16_t 显示_查字形(uint16_t 码点)
     return -1;
 }
 
-/**
-  * @brief  从 UTF-8 串里取一个码点
-  * @retval 消耗的字节数（1~3）；非法序列返回 1
-  */
-static uint8_t 显示_取码点(const char *s, uint16_t *码点)
+/** 从 UTF-8 串取一个码点，返回消耗的字节数（1~3） */
+static uint8_t 字库_取码点(const char *s, uint16_t *码点)
 {
     uint8_t c = (uint8_t)s[0];
 
@@ -550,116 +569,268 @@ static uint8_t 显示_取码点(const char *s, uint16_t *码点)
                          |  (uint16_t)((uint8_t)s[2] & 0x3FU));
         return 3U;
     }
-
     *码点 = 0U;
     return 1U;
 }
 
+/* ============================== 文本绘制 =================================== */
+
 /**
-  * @brief  把一个 16x16 汉字画进 2 列 x 2 行
-  * @note   只写自己那两组 16 字节，**绝不触碰相邻行**。
-  *         越界（列/行超出屏幕）直接丢弃，避免写坏帧缓冲。
+  * @brief  画一个 8x8 ASCII 字符
+  * @note   只写自己那 8x8 区域，不碰相邻字符
   */
-static void 显示_画汉字(uint8_t 列, uint8_t 行, uint16_t 字形下标)
+static void 文本_画ASCII(int16_t x, int16_t y, char 字符, uint8_t 颜色)
+{
+    const uint8_t *字形 = font8x8[(uint8_t)字符 & 0x7FU];
+    uint8_t 列, 行;
+
+    for (列 = 0U; 列 < 8U; 列++)
+    {
+        for (行 = 0U; 行 < 8U; 行++)
+        {
+            if ((字形[行] & (uint8_t)(1U << 列)) != 0U) {
+                OLED_画点((int16_t)(x + 列), (int16_t)(y + 行), 颜色);
+            }
+        }
+    }
+}
+
+/**
+  * @brief  画一个 16x16 汉字
+  * @note   字模正好 16x16，越界部分由 OLED_画点() 裁掉
+  */
+static void 文本_画汉字(int16_t x, int16_t y, uint16_t 字形下标, uint8_t 颜色)
 {
     const uint8_t *字形;
-    uint8_t *上半;
-    uint8_t *下半;
-    uint8_t c;
+    uint8_t 列, 行;
 
-    /* 汉字占 2 列 x 2 行，必须整块都在屏幕内 */
-    if ((uint16_t)列 + 1U >= 显示_列数 || (uint16_t)行 + 1U >= 显示_行数) {
-        return;
-    }
     if (字形下标 >= CN_FONT_COUNT) {
         return;
     }
-
     字形 = cn_font_glyph[字形下标];
-    上半 = &显示_帧缓冲[(uint16_t)行 * 显示_宽度 + (uint16_t)列 * 8U];
-    下半 = &显示_帧缓冲[(uint16_t)(行 + 1U) * 显示_宽度 + (uint16_t)列 * 8U];
 
-    for (c = 0U; c < 16U; c++)
+    for (列 = 0U; 列 < 16U; 列++)
     {
-        上半[c] = 字形[c];          /* 第 0..15 字节 = 上半页 */
-        下半[c] = 字形[16U + c];    /* 第 16..31 字节 = 下半页 */
+        uint8_t 上半 = 字形[列];
+        uint8_t 下半 = 字形[16U + 列];
+
+        for (行 = 0U; 行 < 8U; 行++)
+        {
+            if ((上半 & (uint8_t)(1U << 行)) != 0U) {
+                OLED_画点((int16_t)(x + 列), (int16_t)(y + 行), 颜色);
+            }
+            if ((下半 & (uint8_t)(1U << 行)) != 0U) {
+                OLED_画点((int16_t)(x + 列), (int16_t)(y + 8 + 行), 颜色);
+            }
+        }
     }
+}
+
+void OLED_显示中文串色(int16_t x, int16_t y, const char *utf8, uint8_t 颜色)
+{
+    int16_t 当前位置 = x;
+
+    while (*utf8 != '\0')
+    {
+        uint16_t 码点;
+        uint8_t  步进 = 字库_取码点(utf8, &码点);
+
+        if (码点 < 0x80U)
+        {
+            /* ASCII：8x8，在 16 像素行内垂直居中（下移 4 像素） */
+            if ((当前位置 + 8) > OLED_宽) {
+                break;
+            }
+            文本_画ASCII(当前位置, (int16_t)(y + 4), (char)码点, 颜色);
+            当前位置 = (int16_t)(当前位置 + 8);
+        }
+        else
+        {
+            /* 汉字：16x16，占满整行 */
+            if ((当前位置 + 16) > OLED_宽) {
+                break;
+            }
+            {
+                int16_t 下标 = 字库_查字形(码点);
+                if (下标 >= 0) {
+                    文本_画汉字(当前位置, y, (uint16_t)下标, 颜色);
+                }
+            }
+            当前位置 = (int16_t)(当前位置 + 16);
+        }
+
+        utf8 += 步进;
+    }
+}
+
+void OLED_显示中文串(int16_t x, int16_t y, const char *utf8)
+{
+    OLED_显示中文串色(x, y, utf8, OLED_亮);
+}
+
+void OLED_显示ASCII串色(int16_t x, int16_t y, const char *s, uint8_t 颜色)
+{
+    int16_t 当前位置 = x;
+
+    while (*s != '\0')
+    {
+        if ((当前位置 + 8) > OLED_宽) {
+            break;
+        }
+        文本_画ASCII(当前位置, y, *s, 颜色);
+        当前位置 = (int16_t)(当前位置 + 8);
+        s++;
+    }
+}
+
+void OLED_显示ASCII串(int16_t x, int16_t y, const char *s)
+{
+    OLED_显示ASCII串色(x, y, s, OLED_亮);
+}
+
+uint8_t OLED_文本宽度(const char *utf8)
+{
+    uint16_t 宽 = 0U;
+
+    while (*utf8 != '\0')
+    {
+        uint16_t 码点;
+        uint8_t  步进 = 字库_取码点(utf8, &码点);
+
+        宽 += (码点 < 0x80U) ? 8U : 16U;
+        if (宽 >= OLED_宽) {
+            return OLED_宽;
+        }
+        utf8 += 步进;
+    }
+    return (uint8_t)宽;
+}
+
+void OLED_显示数字(int16_t x, int16_t y, int32_t 值)
+{
+    char     缓冲[12];
+    uint8_t  i = 0U;
+    uint8_t  j;
+    uint32_t 绝对值;
+    uint8_t  负数 = 0U;
+
+    if (值 < 0) {
+        负数 = 1U;
+        绝对值 = (uint32_t)(-(值));
+    } else {
+        绝对值 = (uint32_t)值;
+    }
+
+    do {
+        缓冲[i++] = (char)('0' + (绝对值 % 10U));
+        绝对值 /= 10U;
+    } while ((绝对值 != 0U) && (i < 10U));
+
+    if (负数 != 0U) {
+        缓冲[i++] = '-';
+    }
+
+    /* 反转成正常顺序 */
+    for (j = 0U; j < (uint8_t)(i / 2U); j++)
+    {
+        char t = 缓冲[j];
+        缓冲[j] = 缓冲[i - 1U - j];
+        缓冲[i - 1U - j] = t;
+    }
+    缓冲[i] = '\0';
+
+    OLED_显示ASCII串(x, (int16_t)(y + 4), 缓冲);
+}
+
+void OLED_显示十六进制(int16_t x, int16_t y, uint32_t 值, uint8_t 位数)
+{
+    static const char 十六进制字符[] = "0123456789ABCDEF";
+    char 缓冲[9];
+    uint8_t i;
+
+    if (位数 == 0U) { 位数 = 1U; }
+    if (位数 > 8U)  { 位数 = 8U; }
+
+    for (i = 0U; i < 位数; i++)
+    {
+        缓冲[位数 - 1U - i] = 十六进制字符[值 & 0x0FU];
+        值 >>= 4;
+    }
+    缓冲[位数] = '\0';
+
+    OLED_显示ASCII串(x, (int16_t)(y + 4), 缓冲);
+}
+
+/* ============================== 兼容旧接口 ================================= */
+
+void 显示_初始化(void)
+{
+    OLED_初始化();
+}
+
+void 显示_清屏(void)
+{
+    OLED_清屏();
+}
+
+void 显示_刷新(void)
+{
+    OLED_刷新();
+}
+
+void 显示_画字符(uint8_t 列, uint8_t 行, char 字符)
+{
+    文本_画ASCII((int16_t)列 * 8, (int16_t)行 * 8, 字符, OLED_亮);
+}
+
+void 显示_画字符串(uint8_t 列, uint8_t 行, const char *串)
+{
+    OLED_显示ASCII串((int16_t)列 * 8, (int16_t)行 * 8, 串);
 }
 
 void 显示_画中文(uint8_t 列, uint8_t 行, const char *中英文字符串)
 {
-    while (*中英文字符串 != '\0')
-    {
-        uint16_t 码点;
-        uint8_t  步进 = 显示_取码点(中英文字符串, &码点);
-
-        if (码点 < 0x80U)
-        {
-            /* ASCII：8x8，占 1 列 1 行 */
-            显示_画字符(列, 行, (char)码点);
-            列++;
-        }
-        else
-        {
-            /* 非 ASCII：16x16，占 2 列 2 行；没这个字就留白但照样占位 */
-            int16_t 下标 = 显示_查字形(码点);
-            if (下标 >= 0) {
-                显示_画汉字(列, 行, (uint16_t)下标);
-            }
-            列 = (uint8_t)(列 + 2U);
-        }
-
-        if (列 >= 显示_列数) {
-            break;
-        }
-        中英文字符串 += 步进;
-    }
+    OLED_显示中文串((int16_t)列 * 8, (int16_t)行 * 8, 中英文字符串);
 }
 
-/* ============================== 文字测量 =================================== */
-
-uint8_t 显示_文字像素宽(const char *串)
+void 显示_画空心框(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
 {
-    uint16_t 宽 = 0U;
+    OLED_画矩形(x0, y0, x1, y1, OLED_亮);
+}
 
-    while (*串 != '\0')
+/* ============================== 自检画面 =================================== */
+
+void OLED_显示自检画面(void)
+{
+    uint8_t 行;
+
+    OLED_清屏();
+
+    /* 标题反白条 */
+    OLED_填充矩形(0, 0, OLED_宽 - 1, 15, OLED_亮);
+    OLED_显示中文串色(2, 0, "屏幕自检", OLED_灭);
+
+    /* 中英混排 + 数字 */
+    OLED_显示中文串(0, 16, "汉字");
+    OLED_显示ASCII串(40, 20, "ABC abc 0123");
+    OLED_显示数字(0, 32, -1234);
+
+    /* 边框 + 圆 */
+    OLED_画矩形(0, 48, 63, 63, OLED_亮);
+    OLED_画圆(96, 56, 7, OLED_亮);
+
+    /* 右边逐行小字 */
+    for (行 = 0U; 行 < 3U; 行++)
     {
-        uint16_t 码点;
-        uint8_t  步进 = 显示_取码点(串, &码点);
-
-        if (码点 < 0x80U)
-        {
-            宽 += 8U;
-        }
-        else
-        {
-            /* 汉字：量出字模里真实的墨水横向范围，而不是按满格 16 算 */
-            int16_t 下标 = 显示_查字形(码点);
-            uint8_t 最右 = 0U;
-
-            if (下标 >= 0)
-            {
-                const uint8_t *字形 = cn_font_glyph[下标];
-                uint8_t c;
-
-                for (c = 0U; c < 16U; c++)
-                {
-                    if (字形[c] != 0U || 字形[16U + c] != 0U) {
-                        最右 = (uint8_t)(c + 1U);
-                    }
-                }
-            }
-            宽 += (uint16_t)最右;
-            if (最右 == 0U) {
-                宽 += 16U;              /* 没有字模也按占位算 */
-            }
-        }
-
-        串 += 步进;
+        char 行文字[6];
+        行文字[0] = 'L';
+        行文字[1] = (char)('0' + 行);
+        行文字[2] = ':';
+        行文字[3] = 'o';
+        行文字[4] = 'k';
+        行文字[5] = '\0';
+        OLED_显示ASCII串(72, (int16_t)(16 + 行 * 8), 行文字);
     }
 
-    if (宽 > 显示_宽度) {
-        宽 = 显示_宽度;
-    }
-    return (uint8_t)宽;
+    OLED_刷新();
 }
