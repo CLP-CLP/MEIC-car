@@ -75,6 +75,12 @@ void 菜单_运行(void);
 void 菜单_复位(void);
 
 /**
+  * @brief  请求退出 菜单_运行() 的主循环（不重置状态）
+  * @note   供 menu_tree.c 的动作函数调用：选中任务后退出菜单，回到主屏幕
+  */
+void 菜单_请求退出(void);
+
+/**
   * @brief  串口标定模式：一上电就一直把 5 路 raw 值打到 USB 串口
   *         （OLED 同步显示），不读按键，永不返回。
   * @note   main.c 里用宏 上电进串口标定模式 切换。
@@ -89,8 +95,21 @@ void 菜单_提示(const char *文字, uint16_t 毫秒);
 
 /* ---- 菜单树入口（定义在 menu_tree.c）---- */
 
-const 菜单项 *菜单树_取主表(void);
-const char   *菜单树_取主标题(void);
+/** 任务执行器：void → void 的函数指针，主屏幕用它在任务间更新 UI */
+typedef void (*菜单_任务执行器)(void);
+
+const 菜单项  *菜单树_取主表(void);
+const char    *菜单树_取主标题(void);
+菜单_任务执行器 菜单树_取待执行任务(void);
+void          菜单树_清待执行任务(void);
+const char    *菜单树_取当前任务名(void);
+const char    *菜单树_取当前步信息(void);
+
+/** 绘制一帧主屏幕仪表板（不循环），供 main.c 在任务前后调用 */
+void 主屏幕_画一帧(void);
+
+/** 主屏幕仪表板循环（刷新传感器 / 电机，按任意键退出） */
+void 显示_主屏幕(void);
 
 #ifdef __cplusplus
 }

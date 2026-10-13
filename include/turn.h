@@ -27,6 +27,12 @@ void 左转(void);
   */
 void 右转(void);
 
+/**
+  * @brief  转向循环每帧回调：每隔约 100ms 自动调用一次，用于刷新 OLED 主屏幕
+  * @note   设为 NULL 则不调用；任务开始前置为 主屏幕_画一帧，任务结束后清 NULL
+  */
+extern void (*转向_每帧回调)(void);
+
 #ifdef __cplusplus
 }
 #endif

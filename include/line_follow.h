@@ -109,6 +109,12 @@ uint8_t 巡线_取上次位图(void);
   */
 float 巡线_取最后位置(void);
 
+/**
+  * @brief  巡线循环每帧回调：每隔约 100ms 自动调用一次，用于刷新 OLED 主屏幕
+  * @note   设为 NULL 则不调用；任务开始前置为 主屏幕_画一帧，任务结束后清 NULL
+  */
+extern void (*巡线_每帧回调)(void);
+
 #ifdef __cplusplus
 }
 #endif
