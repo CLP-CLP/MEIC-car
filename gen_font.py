@@ -87,7 +87,7 @@ def find_chinese_chars(project_root, dirs):
     注释里的中文不算，代码中的中文标识符也不算。
     """
     chars = set()
-    cn = re.compile(r'[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
+    cn = re.compile(r'[\u2190-\u21ff\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
     lit = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
     for d in dirs:
