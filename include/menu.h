@@ -81,6 +81,17 @@ void 菜单_复位(void);
   */
 void 菜单_串口标定(void);
 
+/**
+  * @brief  简短提示：清屏 + 一行字 + 停顿
+  * @note   供 menu_tree.c 的动作函数调用
+  */
+void 菜单_提示(const char *文字, uint16_t 毫秒);
+
+/* ---- 菜单树入口（定义在 menu_tree.c）---- */
+
+const 菜单项 *菜单树_取主表(void);
+const char   *菜单树_取主标题(void);
+
 #ifdef __cplusplus
 }
 #endif
