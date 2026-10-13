@@ -10,7 +10,6 @@ Import("env")
 def _run_gen_font(source, target, env):
     """编译前执行 gen_font.py"""
     import subprocess
-    import sys
     import os
 
     script = os.path.join(env.subst("$PROJECT_DIR"), "gen_font.py")
@@ -18,7 +17,7 @@ def _run_gen_font(source, target, env):
     print("  gen_font.py: 扫描中文 → 生成 16x16 字库 ...")
     print("==============================================")
     result = subprocess.run(
-        ["python", script],
+        [r"C:\Users\CLP\AppData\Local\Programs\Python\Python314\python.exe", script],
         cwd=env.subst("$PROJECT_DIR"),
         capture_output=False,
     )
