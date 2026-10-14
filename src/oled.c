@@ -334,13 +334,45 @@ void OLED_设置亮度(uint8_t 亮度)
     oled_命令(亮度);
 }
 
+/* ============================== 裁剪窗口 =================================== */
+
+/*  默认整屏 —— 不设裁剪时行为和以前完全一样。
+    跑马灯会把它收窄到菜单那一行，好让滚动文字不要压到右边的 ">" 和页码。 */
+static int16_t OLED_裁剪左 = 0;
+static int16_t OLED_裁剪上 = 0;
+static int16_t OLED_裁剪右 = OLED_宽 - 1;
+static int16_t OLED_裁剪下 = OLED_高 - 1;
+
+void OLED_设裁剪(int16_t 左, int16_t 上, int16_t 右, int16_t 下)
+{
+    if (左 < 0) { 左 = 0; }
+    if (上 < 0) { 上 = 0; }
+    if (右 > (OLED_宽 - 1)) { 右 = OLED_宽 - 1; }
+    if (下 > (OLED_高 - 1)) { 下 = OLED_高 - 1; }
+
+    OLED_裁剪左 = 左;
+    OLED_裁剪上 = 上;
+    OLED_裁剪右 = 右;
+    OLED_裁剪下 = 下;
+}
+
+void OLED_清裁剪(void)
+{
+    OLED_裁剪左 = 0;
+    OLED_裁剪上 = 0;
+    OLED_裁剪右 = OLED_宽 - 1;
+    OLED_裁剪下 = OLED_高 - 1;
+}
+
 /* ============================== 基本图元 =================================== */
 
 void OLED_画点(int16_t x, int16_t y, uint8_t 颜色)
 {
     uint8_t 掩码;
 
-    if (x < 0 || y < 0 || x >= OLED_宽 || y >= OLED_高) {
+    /* 越界和裁剪窗口一起判：窗口默认就是整屏，所以这等价于原来的边界检查 */
+    if (x < OLED_裁剪左 || x > OLED_裁剪右
+     || y < OLED_裁剪上 || y > OLED_裁剪下) {
         return;
     }
 
@@ -788,6 +820,83 @@ void OLED_显示中文串色(int16_t x, int16_t y, const char *utf8, uint8_t 颜
 void OLED_显示中文串(int16_t x, int16_t y, const char *utf8)
 {
     OLED_显示中文串色(x, y, utf8, OLED_亮);
+}
+
+void OLED_显示中文串滚动(int16_t x, int16_t y, const char *utf8, int16_t 相位)
+{
+    int16_t 文本宽 = (int16_t)OLED_文本宽度(utf8);
+    int16_t 周期;
+
+    if (文本宽 <= 0) {
+        return;
+    }
+
+    周期 = (int16_t)(文本宽 + OLED_滚动间隙);
+
+    相位 = (int16_t)(相位 % 周期);
+    if (相位 < 0) {
+        相位 = (int16_t)(相位 + 周期);
+    }
+
+    /* 两遍：这一份整体左移 相位，右边再补一份，中间隔着一个 OLED_滚动间隙，
+       所以文字滚出去之后会紧接着从右边滚进来，接缝处看不出跳。
+       起点可以是负的 —— 越界的部分被 OLED_画点 的裁剪挡掉，
+       所以这里不需要自己算"该从第几个字开始画"。 */
+    OLED_显示中文串((int16_t)(x - 相位), y, utf8);
+
+    if (相位 > 0) {
+        OLED_显示中文串((int16_t)(x - 相位 + 周期), y, utf8);
+    }
+}
+
+void OLED_合成滑动(const uint8_t *左图, const uint8_t *右图, int16_t 偏移)
+{
+    uint16_t 页;
+    int16_t  x;
+
+    if (偏移 < 0) { 偏移 = 0; }
+    if (偏移 > OLED_宽) { 偏移 = OLED_宽; }
+
+    /* 逐页、逐列搬：偏移 0 = 整屏是左图，偏移 128 = 整屏是右图 */
+    for (页 = 0U; 页 < (uint16_t)OLED_页数; 页++)
+    {
+        uint16_t 基 = (uint16_t)(页 * OLED_宽);
+
+        for (x = 0; x < OLED_宽; x++)
+        {
+            int16_t 源 = (int16_t)(x + 偏移);
+
+            OLED_显存[基 + (uint16_t)x] =
+                (源 < OLED_宽) ? 左图[基 + (uint16_t)源]
+                               : 右图[基 + (uint16_t)(源 - OLED_宽)];
+        }
+    }
+}
+
+void OLED_取显存(uint8_t *目标)
+{
+    uint16_t i;
+
+    if (目标 == 0) {
+        return;
+    }
+
+    for (i = 0U; i < (uint16_t)OLED_显存大小; i++) {
+        目标[i] = OLED_显存[i];
+    }
+}
+
+void OLED_置显存(const uint8_t *源)
+{
+    uint16_t i;
+
+    if (源 == 0) {
+        return;
+    }
+
+    for (i = 0U; i < (uint16_t)OLED_显存大小; i++) {
+        OLED_显存[i] = 源[i];
+    }
 }
 
 void OLED_显示ASCII串色(int16_t x, int16_t y, const char *s, uint8_t 颜色)

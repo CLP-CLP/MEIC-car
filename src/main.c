@@ -29,6 +29,7 @@
 #include "oled.h"                    /* 新增：提前点亮 OLED，校准期间也亮着 */
 #include "oled_text.h"               /* 界面文案（车库时间标定用） */
 #include "proto.h"
+#include "servo.h"                   /* 二维云台舵机（PB8/PB9） */
 #include "tasks.h"                  /* 新增：菜单调用的任务函数声明 */
 #include "turn.h"
 #include "vcp.h"
@@ -62,6 +63,7 @@ int main(void)
 
     巡线_初始化();                  /* 五路红外巡线传感器 (PA0~PA4) */
     电机_初始化();                  /* L298N 双电机（上电保持停止） */
+    舵机_初始化();                  /* 二维云台两路舵机 PB8/PB9，上电到中位 */
 
     灰度_上电检查();                /* 读 Flash、上电次数 +1
                                        （这一步要擦写 Flash，CPU 会停顿约 40 ms，

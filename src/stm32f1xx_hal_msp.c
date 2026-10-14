@@ -10,6 +10,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "ir_sensor.h"
+#include "servo.h"          /* 舵机引脚宏（TIM4 那一路 PWM 用） */
 
 /**
   * @brief  全局 MSP 初始化，由 HAL_Init() 调用
@@ -79,9 +80,13 @@ void HAL_ADC_MspDeInit(ADC_HandleTypeDef *hadc)
 }
 
 /**
-  * @brief  TIM PWM 底层初始化：L298N 的使能脚接 PA6 / PA7
-  *         PA6 = TIM3_CH1 = ENA（左电机）
-  *         PA7 = TIM3_CH2 = ENB（右电机）      详见 motor.h
+  * @brief  TIM PWM 底层初始化
+  *         TIM3：L298N 的使能脚接 PA6 / PA7
+  *                 PA6 = TIM3_CH1 = ENA（左电机）
+  *                 PA7 = TIM3_CH2 = ENB（右电机）      详见 motor.h
+  *         TIM4：二维云台的两个舵机接 PB8 / PB9
+  *                 PB8 = TIM4_CH3 = 水平（pan）
+  *                 PB9 = TIM4_CH4 = 垂直（tilt）       详见 servo.h
   */
 void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef *htim)
 {
@@ -99,5 +104,17 @@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef *htim)
         GPIO_InitStruct.Pull  = GPIO_NOPULL;
         GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    }
+    else if (htim->Instance == TIM4)
+    {
+        /* 舵机 PWM：50 Hz，两个脚挨着方便插云台线（详见 servo.h） */
+        __HAL_RCC_TIM4_CLK_ENABLE();
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+
+        GPIO_InitStruct.Pin   = 舵机_水平_引脚 | 舵机_垂直_引脚;
+        GPIO_InitStruct.Mode  = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Pull  = GPIO_NOPULL;
+        GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(舵机_端口, &GPIO_InitStruct);
     }
 }
