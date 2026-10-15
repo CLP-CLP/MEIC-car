@@ -77,4 +77,20 @@
 #define 文本_舵机调试       "舵机调试"
 #define 文本_舵机提示       "上下调 确认换"
 
+/* ============================== 卡片识别（任务一）=========================== */
+
+#define 文本_卡片识别       "卡片识别"
+#define 文本_识别中         "识别中..."
+#define 文本_稳定           "稳定"
+#define 文本_红             "红"
+#define 文本_黄             "黄"
+#define 文本_圆             "圆"
+#define 文本_三角           "三角"
+#define 文本_方             "方"
+#define 文本_倒库           "倒库"
+#define 文本_侧停           "侧停"
+#define 文本_BC边           "BC边"
+#define 文本_CD边           "CD边"
+#define 文本_AD边           "AD边"
+
 #endif /* __OLED_TEXT_H__ */
