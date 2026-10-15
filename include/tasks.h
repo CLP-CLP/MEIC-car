@@ -27,6 +27,15 @@ extern "C" {
 /* ---- 调试：车库时间标定 ---- */
 #include "../src/tasks/garage_calib.h"
 
+/* ---- 发挥任务一：卡片识别动态车库（假动作） ---- */
+#include "../src/tasks/adv_card_park.h"
+
+/* ---- 发挥任务二：车库搜索与自主停车 ---- */
+#include "../src/tasks/adv_garage_search.h"
+
+/* ---- 发挥任务三：二维云台激光绘图 ---- */
+#include "../src/tasks/adv_laser_draw.h"
+
 /*
  *  原来这些声明直接写在 tasks.h 里，实现放在 main.c 里；
  *  现在实现拆到了 src/tasks/ 目录，每个模块有自己独立的头文件。

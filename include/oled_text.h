@@ -93,4 +93,12 @@
 #define 文本_CD边           "CD边"
 #define 文本_AD边           "AD边"
 
+/* ---- 发挥任务 ---- */
+#define 文本_发挥           "发挥"
+#define 文本_卡片入库       "卡片入库"
+#define 文本_车库搜索       "车库搜索"
+#define 文本_激光绘图       "激光绘图"
+#define 文本_搜索中         "搜索中..."
+#define 文本_绘图完成       "绘图完成"
+
 #endif /* __OLED_TEXT_H__ */

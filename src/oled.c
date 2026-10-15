@@ -224,69 +224,112 @@ void OLED_清屏(void)
     memset(OLED_显存, 0x00, sizeof(OLED_显存));
 }
 
-/* ============================== 分片刷新状态 =============================== */
+/* ============================== 脏区域刷新 ================================= */
 
-/** 分片刷新：已经送出去的字节数（送完清 0） */
-static uint16_t OLED_刷新偏移 = 0U;
+/*
+ *  脏区域优化原理：
+ *    SSD1306 横向寻址模式下，全屏 = 8 页 × 128 列 = 1024 字节。
+ *    普通刷新每次通过 I2C 发送全部 1024 字节（约 20~30ms）。
+ *    
+ *    脏区域方案维护一份"前帧快照"（1024 字节 RAM），在开始刷新时逐页比较
+ *    新旧显存，只标记变化的页。刷新时跳过干净页——只对脏页发窗口命令 + 128
+ *    字节数据。典型场景（主屏幕）只有 3~5 页变化，I2C 传输量减少 50~60%。
+ *
+ *    RAM 开销：1024 字节（前帧）+ 1 字节（位图）+ 2 字节（状态）= 1027 字节
+ */
 
-/** 1 = 正在分片送一帧，0 = 没在送 */
-static uint8_t  OLED_分片中   = 0U;
+static uint8_t  OLED_前帧[OLED_宽 * OLED_高 / 8U];   /* 前帧快照 */
 
-void OLED_刷新(void)
+static uint8_t  OLED_脏页位图;   /* bit0=page0..bit7=page7，1=该页有变化 */
+static int8_t   OLED_当前页;     /* 当前正在发的脏页号，-1=已全部发完 */
+static uint8_t  OLED_页内偏移;   /* 当前页内已发字节数 (0~127) */
+
+/** 普通刷新也使用脏区域方案（内部复用分片逻辑） */
+static void oled_设置页窗口(uint8_t 页)
 {
-    static const uint8_t 列地址[] = { 0x21, 0x00, 0x7F };
-    static const uint8_t 页地址[] = { 0x22, 0x00, 0x07 };
-    uint16_t 已发 = 0U;
+    uint8_t 列窗口[] = { 0x21, 0x00, 0x7F };
+    uint8_t 页窗口[] = { 0x22, 页, 页 };
 
-    /* 设定窗口：列 0..127，页 0..7，然后一次把 1024 字节显存送过去 */
-    oled_命令序列(列地址, (uint16_t)sizeof(列地址));
-    oled_命令序列(页地址, (uint16_t)sizeof(页地址));
-
-    /* 分块发送，单次传输不要太长；某块失败就重发一次 */
-    while (已发 < (uint16_t)sizeof(OLED_显存))
-    {
-        uint16_t 本块 = (uint16_t)(sizeof(OLED_显存) - 已发);
-        if (本块 > 128U) {
-            本块 = 128U;
-        }
-
-        if (i2c_发送(0x40U, &OLED_显存[已发], 本块) == 0U) {
-            (void)i2c_发送(0x40U, &OLED_显存[已发], 本块);
-        }
-        已发 = (uint16_t)(已发 + 本块);
-    }
-
-    /* 整帧送完：分片状态一并复位，免得半截状态和这里打架 */
-    OLED_刷新偏移 = 0U;
-    OLED_分片中   = 0U;
+    oled_命令序列(列窗口, (uint16_t)sizeof(列窗口));
+    oled_命令序列(页窗口, (uint16_t)sizeof(页窗口));
 }
 
 void OLED_开始分片刷新(void)
 {
-    static const uint8_t 列地址[] = { 0x21, 0x00, 0x7F };
-    static const uint8_t 页地址[] = { 0x22, 0x00, 0x07 };
+    uint8_t p;
 
-    /* 窗口设成整屏。之后 SSD1306 的地址指针会自己往下走，
-       所以后面每次续传都不用再发地址，接着发数据即可。 */
-    oled_命令序列(列地址, (uint16_t)sizeof(列地址));
-    oled_命令序列(页地址, (uint16_t)sizeof(页地址));
+    OLED_脏页位图 = 0U;
 
-    OLED_刷新偏移 = 0U;
-    OLED_分片中   = 1U;
+    for (p = 0U; p < 8U; p++) {
+        uint16_t base = (uint16_t)p * 128U;
+        uint8_t  脏   = 0U;
+        uint8_t  i;
+
+        /* 逐字节比较当前页，不同则标记脏并更新快照 */
+        for (i = 0U; i < 128U; i++) {
+            if (OLED_显存[base + i] != OLED_前帧[base + i]) {
+                脏 = 1U;
+                OLED_前帧[base + i] = OLED_显存[base + i];
+            }
+        }
+
+        if (脏 != 0U) {
+            OLED_脏页位图 |= (uint8_t)(1U << p);
+        }
+    }
+
+    if (OLED_脏页位图 == 0U) {
+        OLED_当前页 = -1;   /* 无脏页，直接完成 */
+        return;
+    }
+
+    /* 定位第一个脏页 */
+    OLED_当前页 = 0;
+    while (OLED_当前页 < 8 &&
+           (OLED_脏页位图 & (uint8_t)(1U << OLED_当前页)) == 0U) {
+        OLED_当前页++;
+    }
+
+    if (OLED_当前页 >= 8) {
+        OLED_当前页 = -1;
+        return;
+    }
+
+    /* 设置第一个脏页的窗口，准备发送 */
+    oled_设置页窗口((uint8_t)OLED_当前页);
+    OLED_页内偏移 = 0U;
 }
 
 uint8_t OLED_刷新分片(uint16_t 最多字节)
 {
+    uint8_t  当前脏页;
     uint16_t 剩余;
 
-    if (OLED_分片中 == 0U) {
-        return 1U;                  /* 没在送帧，当作"已经送完" */
+    if (OLED_当前页 < 0) {
+        return 1U;   /* 全部发送完毕 */
     }
 
-    剩余 = (uint16_t)(sizeof(OLED_显存) - (uint32_t)OLED_刷新偏移);
+    当前脏页 = (uint8_t)OLED_当前页;
+
+    /* 本页还剩多少字节没发 */
+    剩余 = 128U - (uint16_t)OLED_页内偏移;
     if (剩余 == 0U) {
-        OLED_分片中 = 0U;
-        return 1U;
+        /* 本页发完，找下一个脏页 */
+        OLED_当前页++;
+        while (OLED_当前页 < 8 &&
+               (OLED_脏页位图 & (uint8_t)(1U << OLED_当前页)) == 0U) {
+            OLED_当前页++;
+        }
+
+        if (OLED_当前页 >= 8) {
+            OLED_当前页 = -1;
+            return 1U;   /* 所有脏页发完 */
+        }
+
+        /* 设置新页窗口 */
+        oled_设置页窗口((uint8_t)OLED_当前页);
+        OLED_页内偏移 = 0U;
+        return 0U;       /* 下一轮再发数据 */
     }
 
     if (最多字节 == 0U) {
@@ -296,20 +339,50 @@ uint8_t OLED_刷新分片(uint16_t 最多字节)
         最多字节 = 剩余;
     }
 
-    /* 某一片发失败就重发一次（和整帧刷新一样的容错） */
-    if (i2c_发送(0x40U, &OLED_显存[OLED_刷新偏移], 最多字节) == 0U) {
-        (void)i2c_发送(0x40U, &OLED_显存[OLED_刷新偏移], 最多字节);
+    {
+        uint16_t base = (uint16_t)当前脏页 * 128U + (uint16_t)OLED_页内偏移;
+
+        if (i2c_发送(0x40U, &OLED_显存[base], 最多字节) == 0U) {
+            (void)i2c_发送(0x40U, &OLED_显存[base], 最多字节);
+        }
     }
 
-    OLED_刷新偏移 = (uint16_t)(OLED_刷新偏移 + 最多字节);
+    OLED_页内偏移 = (uint8_t)(OLED_页内偏移 + (uint8_t)最多字节);
 
-    if (OLED_刷新偏移 >= (uint16_t)sizeof(OLED_显存)) {
-        OLED_刷新偏移 = 0U;
-        OLED_分片中   = 0U;
-        return 1U;
+    if (OLED_页内偏移 >= 128U) {
+        /* 本页发完，跳到下一脏页 */
+        OLED_当前页++;
+        while (OLED_当前页 < 8 &&
+               (OLED_脏页位图 & (uint8_t)(1U << OLED_当前页)) == 0U) {
+            OLED_当前页++;
+        }
+
+        if (OLED_当前页 >= 8) {
+            OLED_当前页 = -1;
+            return 1U;
+        }
+
+        oled_设置页窗口((uint8_t)OLED_当前页);
+        OLED_页内偏移 = 0U;
     }
 
     return 0U;
+}
+
+/* ============================== 整帧刷新（阻塞版） ========================= */
+
+void OLED_刷新(void)
+{
+    OLED_开始分片刷新();
+
+    if (OLED_当前页 < 0) {
+        return;   /* 无脏页 */
+    }
+
+    /* 轮询发送所有脏页，每次发一整页（128 字节） */
+    while (OLED_刷新分片(128U) == 0U) {
+        /* 继续发直到全部发完 */
+    }
 }
 
 void OLED_清屏并刷新(void)

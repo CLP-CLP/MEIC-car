@@ -81,22 +81,35 @@ def find_chinese_fonts():
 
 # ============================ 字符扫描 =======================================
 
+def _文件包含显示头(content):
+    """
+    判断文件内容是否引用了 OLED 显示模块。
+    只有引用了 oled.h 或 oled_text.h 的文件才可能往 OLED 写中文。
+    """
+    return bool(re.search(r'#include\s+"oled(_text)?\.h"', content))
+
+
 def find_chinese_chars(project_root, dirs):
     """
     扫描 .c/.h 里**字符串字面量**中的中文/全角标点，返回排序后的唯一字符列表。
-    注释里的中文不算，代码中的中文标识符也不算。
+
+    关键改进（相比旧版）：
+    - 不再扫描全部文件，而是先过滤出"引用了 oled.h/oled_text.h 的文件"
+    - 但 oled_text.h / oled.h 本身强制纳入（它们是文案集中表）
+    - 注释里的中文不算，代码中的中文标识符也不算
+    - 这样字库不会被子系统里的调试打印、UART 日志等无关字符串撑大
     """
     chars = set()
     cn = re.compile(r'[\u2190-\u21ff\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
     lit = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+    oled_files = set()       # 需要扫描的文件（绝对路径）
 
     for d in dirs:
         full = os.path.join(project_root, d)
         if not os.path.isdir(full):
             continue
         for root, subdirs, files in os.walk(full):
-            # 跳过嵌套的独立工程（比如 meic/ 里也有一份 main.c）：
-            # 只扫本工程自己的代码，否则字库会被别处的文案撑大。
             subdirs[:] = [s for s in subdirs
                           if not os.path.exists(os.path.join(root, s, "platformio.ini"))]
             for fn in files:
@@ -106,16 +119,34 @@ def find_chinese_chars(project_root, dirs):
                 try:
                     with open(path, "r", encoding="utf-8") as fp:
                         content = fp.read()
-                except Exception as e:
-                    print(f"  警告: 读取 {path} 失败: {e}")
+                except Exception:
                     continue
 
-                found = set()
-                for m in lit.finditer(content):
-                    found.update(cn.findall(m.group(1)))
-                if found:
-                    print(f"  {os.path.relpath(path, project_root)}: {len(found)} 个显示用字符")
-                chars.update(found)
+                # oled_text.h / oled.h 是文案集中表，强制纳入
+                if fn in ("oled_text.h", "oled.h") and d == "include":
+                    oled_files.add(path)
+                    continue
+
+                # 其余文件：只有引用了 oled.h/oled_text.h 才纳入
+                if _文件包含显示头(content):
+                    oled_files.add(path)
+
+    print(f"  显示相关文件: {len(oled_files)} 个")
+
+    for path in sorted(oled_files):
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                content = fp.read()
+        except Exception as e:
+            print(f"  警告: 读取 {path} 失败: {e}")
+            continue
+
+        found = set()
+        for m in lit.finditer(content):
+            found.update(cn.findall(m.group(1)))
+        if found:
+            print(f"  {os.path.relpath(path, project_root)}: {len(found)} 个显示用字符")
+        chars.update(found)
 
     return sorted(chars)
 
