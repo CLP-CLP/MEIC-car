@@ -61,8 +61,8 @@ static uint8_t 任务三_读卡片(void)
     uint32_t 开始时刻;
     uint8_t  稳定罗马 = 0U;
 
-    舵机_设置角度(舵机_垂直, 70);
-    HAL_Delay(300U);
+    舵机_设置角度(舵机_水平, 135);
+    HAL_Delay(10000U);
 
     开始时刻 = HAL_GetTick();
 
@@ -105,10 +105,10 @@ static uint8_t 任务三_读卡片(void)
                 /* 罗马数字 → 文本 */
                 switch (上次罗马)
                 {
-                    case 1U: (void)snprintf(行, sizeof(行), "I   -> A点"); break;
-                    case 3U: (void)snprintf(行, sizeof(行), "III -> B点"); break;
-                    case 5U: (void)snprintf(行, sizeof(行), "V   -> C点"); break;
-                    case 7U: (void)snprintf(行, sizeof(行), "VII -> D点"); break;
+                    case 1U: (void)snprintf(行, sizeof(行), "I   -> D点"); break;
+                    case 3U: (void)snprintf(行, sizeof(行), "III -> C点"); break;
+                    case 5U: (void)snprintf(行, sizeof(行), "V   -> B点"); break;
+                    case 7U: (void)snprintf(行, sizeof(行), "VII -> A点"); break;
                     default: (void)snprintf(行, sizeof(行), "?");
                              break;
                 }
@@ -117,10 +117,10 @@ static uint8_t 任务三_读卡片(void)
                 /* 目标预览 */
                 switch (上次罗马)
                 {
-                    case 1U: 目标 = 'A'; break;
-                    case 3U: 目标 = 'B'; break;
-                    case 5U: 目标 = 'C'; break;
-                    case 7U: 目标 = 'D'; break;
+                    case 1U: 目标 = 'D'; break;
+                    case 3U: 目标 = 'C'; break;
+                    case 5U: 目标 = 'B'; break;
+                    case 7U: 目标 = 'A'; break;
                     default: break;
                 }
                 if (目标 != 0U) {
@@ -181,10 +181,10 @@ static uint8_t 任务三_读卡片(void)
 
     switch (稳定罗马)
     {
-        case 1U:  return 'A';           /* I   -> A 点 */
-        case 3U:  return 'B';           /* III -> B 点 */
-        case 5U:  return 'C';           /* V   -> C 点 */
-        case 7U:  return 'D';           /* VII -> D 点 */
+        case 1U:  return 'D';           /* I   -> D 点 */
+        case 3U:  return 'C';           /* III -> C 点 */
+        case 5U:  return 'B';           /* V   -> B 点 */
+        case 7U:  return 'A';           /* VII -> A 点 */
         default:  return 0U;
     }
 }
